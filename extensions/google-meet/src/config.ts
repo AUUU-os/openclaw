@@ -1,17 +1,27 @@
+// Google Meet helper module supports config behavior.
+import { buildMeetingSoxAudioCommands } from "openclaw/plugin-sdk/meeting-runtime";
+import {
+  addTimerTimeoutGraceMs,
+  resolvePositiveTimerTimeoutMs,
+} from "openclaw/plugin-sdk/number-runtime";
 import {
   REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
   resolveRealtimeVoiceAgentConsultToolPolicy,
   type RealtimeVoiceAgentConsultToolPolicy,
 } from "openclaw/plugin-sdk/realtime-voice";
 import {
+  asRecord,
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
-} from "openclaw/plugin-sdk/text-runtime";
+  normalizeOptionalTrimmedStringList,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export type GoogleMeetTransport = "chrome" | "chrome-node" | "twilio";
-export type GoogleMeetMode = "realtime" | "transcribe";
+export type GoogleMeetMode = "agent" | "bidi" | "transcribe";
+export type GoogleMeetModeInput = GoogleMeetMode | "realtime";
+type GoogleMeetRealtimeStrategy = "agent" | "bidi";
 type GoogleMeetChromeAudioFormat = "pcm16-24khz" | "g711-ulaw-8khz";
-export type GoogleMeetToolPolicy = RealtimeVoiceAgentConsultToolPolicy;
+type GoogleMeetToolPolicy = RealtimeVoiceAgentConsultToolPolicy;
 
 export type GoogleMeetConfig = {
   enabled: boolean;
@@ -26,6 +36,7 @@ export type GoogleMeetConfig = {
   chrome: {
     audioBackend: "blackhole-2ch";
     audioFormat: GoogleMeetChromeAudioFormat;
+    audioBufferBytes: number;
     launch: boolean;
     browserProfile?: string;
     guestName: string;
@@ -60,7 +71,10 @@ export type GoogleMeetConfig = {
     introMessage?: string;
   };
   realtime: {
+    strategy: GoogleMeetRealtimeStrategy;
     provider?: string;
+    transcriptionProvider?: string;
+    voiceProvider?: string;
     model?: string;
     instructions?: string;
     introMessage?: string;
@@ -83,84 +97,60 @@ export type GoogleMeetConfig = {
   };
 };
 
-export const DEFAULT_GOOGLE_MEET_AUDIO_INPUT_COMMAND = [
-  "sox",
-  "-q",
-  "-t",
-  "coreaudio",
-  "BlackHole 2ch",
-  "-t",
-  "raw",
-  "-r",
-  "24000",
-  "-c",
-  "1",
-  "-e",
-  "signed-integer",
-  "-b",
-  "16",
-  "-L",
-  "-",
-] as const;
+export function resolveGoogleMeetGatewayOperationTimeoutMs(config: GoogleMeetConfig): number {
+  return Math.max(
+    60_000,
+    addTimerTimeoutGraceMs(config.chrome.joinTimeoutMs, 30_000) ?? 1,
+    addTimerTimeoutGraceMs(config.voiceCall.requestTimeoutMs, 10_000) ?? 1,
+  );
+}
 
-export const DEFAULT_GOOGLE_MEET_AUDIO_OUTPUT_COMMAND = [
-  "sox",
-  "-q",
-  "-t",
-  "raw",
-  "-r",
-  "24000",
-  "-c",
-  "1",
-  "-e",
-  "signed-integer",
-  "-b",
-  "16",
-  "-L",
-  "-",
-  "-t",
-  "coreaudio",
-  "BlackHole 2ch",
-] as const;
+const SOX_DEFAULT_BUFFER_BYTES = 8192;
+const SOX_MIN_BUFFER_BYTES = 17;
+const DEFAULT_GOOGLE_MEET_AUDIO_BUFFER_BYTES = SOX_DEFAULT_BUFFER_BYTES / 2;
+const PLAIN_DECIMAL_NUMBER_RE = /^\d+(?:\.\d+)?$/;
 
-const LEGACY_GOOGLE_MEET_AUDIO_INPUT_COMMAND = [
-  "rec",
-  "-q",
-  "-t",
-  "raw",
-  "-r",
-  "8000",
-  "-c",
-  "1",
-  "-e",
-  "mu-law",
-  "-b",
-  "8",
-  "-",
-] as const;
+function buildGoogleMeetSoxAudioCommands(format: GoogleMeetChromeAudioFormat, bufferBytes: number) {
+  return format === "g711-ulaw-8khz"
+    ? buildMeetingSoxAudioCommands({
+        bufferBytes,
+        format: {
+          sampleRate: 8_000,
+          channels: 1,
+          encoding: "mu-law",
+          bits: 8,
+        },
+      })
+    : buildMeetingSoxAudioCommands({
+        bufferBytes,
+        device: "BlackHole 2ch",
+        deviceType: "coreaudio",
+        format: {
+          sampleRate: 24_000,
+          channels: 1,
+          encoding: "signed-integer",
+          bits: 16,
+          endian: "little",
+        },
+      });
+}
 
-const LEGACY_GOOGLE_MEET_AUDIO_OUTPUT_COMMAND = [
-  "play",
-  "-q",
-  "-t",
-  "raw",
-  "-r",
-  "8000",
-  "-c",
-  "1",
-  "-e",
-  "mu-law",
-  "-b",
-  "8",
-  "-",
-] as const;
+const DEFAULT_GOOGLE_MEET_SOX_COMMANDS = buildGoogleMeetSoxAudioCommands(
+  "pcm16-24khz",
+  DEFAULT_GOOGLE_MEET_AUDIO_BUFFER_BYTES,
+);
+
+export const DEFAULT_GOOGLE_MEET_AUDIO_INPUT_COMMAND =
+  DEFAULT_GOOGLE_MEET_SOX_COMMANDS.inputCommand;
+export const DEFAULT_GOOGLE_MEET_AUDIO_OUTPUT_COMMAND =
+  DEFAULT_GOOGLE_MEET_SOX_COMMANDS.outputCommand;
 
 const DEFAULT_GOOGLE_MEET_CHROME_AUDIO_FORMAT: GoogleMeetChromeAudioFormat = "pcm16-24khz";
 const DEFAULT_GOOGLE_MEET_BARGE_IN_RMS_THRESHOLD = 650;
 const DEFAULT_GOOGLE_MEET_BARGE_IN_PEAK_THRESHOLD = 2500;
 const DEFAULT_GOOGLE_MEET_BARGE_IN_COOLDOWN_MS = 900;
 
-const DEFAULT_GOOGLE_MEET_REALTIME_INSTRUCTIONS = `You are joining a private Google Meet as an OpenClaw agent. Keep spoken replies brief and natural. When a question needs deeper reasoning, current information, or tools, call ${REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME} before answering.`;
+const DEFAULT_GOOGLE_MEET_REALTIME_INSTRUCTIONS = `You are joining a private Google Meet as an OpenClaw voice transport. Keep spoken replies brief and natural. In agent mode, wait for OpenClaw consult results and speak them exactly. In bidi mode, answer directly and call ${REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME} for deeper reasoning, current information, or tools.`;
 const DEFAULT_GOOGLE_MEET_REALTIME_INTRO_MESSAGE = "Say exactly: I'm here and listening.";
 
 const DEFAULT_GOOGLE_MEET_CONFIG: GoogleMeetConfig = {
@@ -170,10 +160,11 @@ const DEFAULT_GOOGLE_MEET_CONFIG: GoogleMeetConfig = {
     enrollmentAcknowledged: false,
   },
   defaultTransport: "chrome",
-  defaultMode: "realtime",
+  defaultMode: "agent",
   chrome: {
     audioBackend: "blackhole-2ch",
     audioFormat: DEFAULT_GOOGLE_MEET_CHROME_AUDIO_FORMAT,
+    audioBufferBytes: DEFAULT_GOOGLE_MEET_AUDIO_BUFFER_BYTES,
     launch: true,
     guestName: "OpenClaw Agent",
     reuseExistingTab: true,
@@ -191,11 +182,13 @@ const DEFAULT_GOOGLE_MEET_CONFIG: GoogleMeetConfig = {
   voiceCall: {
     enabled: true,
     requestTimeoutMs: 30_000,
-    dtmfDelayMs: 2_500,
+    dtmfDelayMs: 12_000,
     postDtmfSpeechDelayMs: 5_000,
   },
   realtime: {
+    strategy: "agent",
     provider: "openai",
+    transcriptionProvider: "openai",
     instructions: DEFAULT_GOOGLE_MEET_REALTIME_INSTRUCTIONS,
     introMessage: DEFAULT_GOOGLE_MEET_REALTIME_INTRO_MESSAGE,
     toolPolicy: "safe-read-only",
@@ -233,12 +226,6 @@ const GOOGLE_MEET_PREVIEW_ACK_KEYS = [
   "GOOGLE_MEET_PREVIEW_ACK",
 ] as const;
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
-}
-
 function resolveBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
@@ -247,12 +234,17 @@ function resolveNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function resolveTimerConfigMs(value: unknown, fallback: number): number {
+  return resolvePositiveTimerTimeoutMs(resolveNumber(value, fallback), fallback);
+}
+
 function resolveOptionalNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
   if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value);
+    const trimmed = value.trim();
+    const parsed = PLAIN_DECIMAL_NUMBER_RE.test(trimmed) ? Number(trimmed) : Number.NaN;
     return Number.isFinite(parsed) ? parsed : undefined;
   }
   return undefined;
@@ -266,6 +258,10 @@ function readEnvString(env: NodeJS.ProcessEnv, keys: readonly string[]): string 
     }
   }
   return undefined;
+}
+
+function normalizeStringAllowEmpty(value: unknown): string | undefined {
+  return typeof value === "string" ? value.trim() : undefined;
 }
 
 function readEnvBoolean(env: NodeJS.ProcessEnv, keys: readonly string[]): boolean | undefined {
@@ -287,13 +283,7 @@ function readEnvNumber(env: NodeJS.ProcessEnv, keys: readonly string[]): number 
 }
 
 function resolveStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const normalized = value
-    .map((entry) => normalizeOptionalString(entry))
-    .filter((entry): entry is string => Boolean(entry));
-  return normalized.length > 0 ? normalized : undefined;
+  return normalizeOptionalTrimmedStringList(value);
 }
 
 function resolveProvidersConfig(value: unknown): Record<string, Record<string, unknown>> {
@@ -318,7 +308,20 @@ function resolveTransport(value: unknown, fallback: GoogleMeetTransport): Google
 
 function resolveMode(value: unknown, fallback: GoogleMeetMode): GoogleMeetMode {
   const normalized = normalizeOptionalLowercaseString(value);
-  return normalized === "realtime" || normalized === "transcribe" ? normalized : fallback;
+  if (normalized === "realtime") {
+    return "agent";
+  }
+  return normalized === "agent" || normalized === "bidi" || normalized === "transcribe"
+    ? normalized
+    : fallback;
+}
+
+function resolveRealtimeStrategy(
+  value: unknown,
+  fallback: GoogleMeetRealtimeStrategy,
+): GoogleMeetRealtimeStrategy {
+  const normalized = normalizeOptionalLowercaseString(value);
+  return normalized === "agent" || normalized === "bidi" ? normalized : fallback;
 }
 
 function resolveChromeAudioFormat(value: unknown): GoogleMeetChromeAudioFormat | undefined {
@@ -340,23 +343,33 @@ function resolveChromeAudioFormat(value: unknown): GoogleMeetChromeAudioFormat |
   }
 }
 
-function defaultAudioInputCommand(format: GoogleMeetChromeAudioFormat): readonly string[] {
-  return format === "g711-ulaw-8khz"
-    ? LEGACY_GOOGLE_MEET_AUDIO_INPUT_COMMAND
-    : DEFAULT_GOOGLE_MEET_AUDIO_INPUT_COMMAND;
+function resolveAudioBufferBytes(value: unknown, fallback: number): number {
+  const number = resolveNumber(value, fallback);
+  if (!Number.isFinite(number) || number <= 0) {
+    return fallback;
+  }
+  return Math.max(SOX_MIN_BUFFER_BYTES, Math.trunc(number));
 }
 
-function defaultAudioOutputCommand(format: GoogleMeetChromeAudioFormat): readonly string[] {
-  return format === "g711-ulaw-8khz"
-    ? LEGACY_GOOGLE_MEET_AUDIO_OUTPUT_COMMAND
-    : DEFAULT_GOOGLE_MEET_AUDIO_OUTPUT_COMMAND;
+function defaultAudioInputCommand(
+  format: GoogleMeetChromeAudioFormat,
+  bufferBytes: number,
+): string[] {
+  return buildGoogleMeetSoxAudioCommands(format, bufferBytes).inputCommand;
+}
+
+function defaultAudioOutputCommand(
+  format: GoogleMeetChromeAudioFormat,
+  bufferBytes: number,
+): string[] {
+  return buildGoogleMeetSoxAudioCommands(format, bufferBytes).outputCommand;
 }
 
 export function resolveGoogleMeetConfig(input: unknown): GoogleMeetConfig {
   return resolveGoogleMeetConfigWithEnv(input);
 }
 
-export function resolveGoogleMeetConfigWithEnv(
+function resolveGoogleMeetConfigWithEnv(
   input: unknown,
   env: NodeJS.ProcessEnv = process.env,
 ): GoogleMeetConfig {
@@ -371,10 +384,16 @@ export function resolveGoogleMeetConfigWithEnv(
   const audioFormat =
     resolveChromeAudioFormat(chrome.audioFormat) ??
     (hasCustomAudioCommand ? "g711-ulaw-8khz" : DEFAULT_GOOGLE_MEET_CONFIG.chrome.audioFormat);
+  const audioBufferBytes = resolveAudioBufferBytes(
+    chrome.audioBufferBytes,
+    DEFAULT_GOOGLE_MEET_CONFIG.chrome.audioBufferBytes,
+  );
   const chromeNode = asRecord(raw.chromeNode);
   const twilio = asRecord(raw.twilio);
   const voiceCall = asRecord(raw.voiceCall);
   const realtime = asRecord(raw.realtime);
+  const realtimeProvider = normalizeOptionalString(realtime.provider);
+  const resolvedRealtimeProvider = realtimeProvider ?? DEFAULT_GOOGLE_MEET_CONFIG.realtime.provider;
   const oauth = asRecord(raw.oauth);
   const auth = asRecord(raw.auth);
 
@@ -400,6 +419,7 @@ export function resolveGoogleMeetConfigWithEnv(
     chrome: {
       audioBackend: "blackhole-2ch",
       audioFormat,
+      audioBufferBytes,
       launch: resolveBoolean(chrome.launch, DEFAULT_GOOGLE_MEET_CONFIG.chrome.launch),
       browserProfile: normalizeOptionalString(chrome.browserProfile),
       guestName:
@@ -409,18 +429,18 @@ export function resolveGoogleMeetConfigWithEnv(
         DEFAULT_GOOGLE_MEET_CONFIG.chrome.reuseExistingTab,
       ),
       autoJoin: resolveBoolean(chrome.autoJoin, DEFAULT_GOOGLE_MEET_CONFIG.chrome.autoJoin),
-      joinTimeoutMs: resolveNumber(
+      joinTimeoutMs: resolveTimerConfigMs(
         chrome.joinTimeoutMs,
         DEFAULT_GOOGLE_MEET_CONFIG.chrome.joinTimeoutMs,
       ),
-      waitForInCallMs: resolveNumber(
+      waitForInCallMs: resolveTimerConfigMs(
         chrome.waitForInCallMs,
         DEFAULT_GOOGLE_MEET_CONFIG.chrome.waitForInCallMs,
       ),
-      audioInputCommand: configuredAudioInputCommand ?? [...defaultAudioInputCommand(audioFormat)],
-      audioOutputCommand: configuredAudioOutputCommand ?? [
-        ...defaultAudioOutputCommand(audioFormat),
-      ],
+      audioInputCommand:
+        configuredAudioInputCommand ?? defaultAudioInputCommand(audioFormat, audioBufferBytes),
+      audioOutputCommand:
+        configuredAudioOutputCommand ?? defaultAudioOutputCommand(audioFormat, audioBufferBytes),
       bargeInInputCommand: resolveStringArray(chrome.bargeInInputCommand),
       bargeInRmsThreshold: resolveNumber(
         chrome.bargeInRmsThreshold,
@@ -430,7 +450,7 @@ export function resolveGoogleMeetConfigWithEnv(
         chrome.bargeInPeakThreshold,
         DEFAULT_GOOGLE_MEET_CONFIG.chrome.bargeInPeakThreshold,
       ),
-      bargeInCooldownMs: resolveNumber(
+      bargeInCooldownMs: resolveTimerConfigMs(
         chrome.bargeInCooldownMs,
         DEFAULT_GOOGLE_MEET_CONFIG.chrome.bargeInCooldownMs,
       ),
@@ -449,29 +469,38 @@ export function resolveGoogleMeetConfigWithEnv(
       enabled: resolveBoolean(voiceCall.enabled, DEFAULT_GOOGLE_MEET_CONFIG.voiceCall.enabled),
       gatewayUrl: normalizeOptionalString(voiceCall.gatewayUrl),
       token: normalizeOptionalString(voiceCall.token),
-      requestTimeoutMs: resolveNumber(
+      requestTimeoutMs: resolveTimerConfigMs(
         voiceCall.requestTimeoutMs,
         DEFAULT_GOOGLE_MEET_CONFIG.voiceCall.requestTimeoutMs,
       ),
-      dtmfDelayMs: resolveNumber(
+      dtmfDelayMs: resolveTimerConfigMs(
         voiceCall.dtmfDelayMs,
         DEFAULT_GOOGLE_MEET_CONFIG.voiceCall.dtmfDelayMs,
       ),
-      postDtmfSpeechDelayMs: resolveNumber(
+      postDtmfSpeechDelayMs: resolveTimerConfigMs(
         voiceCall.postDtmfSpeechDelayMs,
         DEFAULT_GOOGLE_MEET_CONFIG.voiceCall.postDtmfSpeechDelayMs,
       ),
       introMessage: normalizeOptionalString(voiceCall.introMessage),
     },
     realtime: {
-      provider:
-        normalizeOptionalString(realtime.provider) ?? DEFAULT_GOOGLE_MEET_CONFIG.realtime.provider,
+      strategy: resolveRealtimeStrategy(
+        realtime.strategy,
+        DEFAULT_GOOGLE_MEET_CONFIG.realtime.strategy,
+      ),
+      provider: resolvedRealtimeProvider,
+      transcriptionProvider:
+        normalizeOptionalString(realtime.transcriptionProvider) ??
+        (realtimeProvider && realtimeProvider !== "google"
+          ? resolvedRealtimeProvider
+          : DEFAULT_GOOGLE_MEET_CONFIG.realtime.transcriptionProvider),
+      voiceProvider: normalizeOptionalString(realtime.voiceProvider),
       model: normalizeOptionalString(realtime.model) ?? DEFAULT_GOOGLE_MEET_CONFIG.realtime.model,
       instructions:
         normalizeOptionalString(realtime.instructions) ??
         DEFAULT_GOOGLE_MEET_CONFIG.realtime.instructions,
       introMessage:
-        normalizeOptionalString(realtime.introMessage) ??
+        normalizeStringAllowEmpty(realtime.introMessage) ??
         DEFAULT_GOOGLE_MEET_CONFIG.realtime.introMessage,
       agentId: normalizeOptionalString(realtime.agentId),
       toolPolicy: resolveRealtimeVoiceAgentConsultToolPolicy(

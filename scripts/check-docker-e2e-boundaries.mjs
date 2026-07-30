@@ -6,12 +6,35 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { laneResources, laneWeight } from "./lib/docker-e2e-plan.mjs";
-import { allReleasePathLanes, mainLanes, tailLanes } from "./lib/docker-e2e-scenarios.mjs";
+import {
+  allReleasePathLanes,
+  mainLanes,
+  publicInstallerLanes,
+  tailLanes,
+} from "./lib/docker-e2e-scenarios.mjs";
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const errors = [];
 const packageJson = JSON.parse(readText("package.json"));
 const packageScripts = new Set(Object.keys(packageJson.scripts ?? {}));
+// These lanes prove package-installed surfaces against live auth, so they
+// intentionally need both live credentials and a package-backed image.
+const livePackageBackedLanes = new Set([
+  "install-e2e-anthropic",
+  "install-e2e-openai",
+  "live-codex-npm-plugin",
+  "live-mcp-code-mode-gateway",
+  "live-plugin-tool",
+  "npm-telegram-live",
+  "openai-chat-tools",
+  "openwebui",
+]);
+// These lanes intentionally build a focused source-checkout image instead of
+// consuming the shared package E2E images.
+const sourceCheckoutImageLanes = new Set([
+  "docker-selected-plugins",
+  "plugin-binding-command-escape",
+]);
 
 function readText(relativePath) {
   return fs.readFileSync(path.join(ROOT_DIR, relativePath), "utf8");
@@ -29,13 +52,43 @@ function walk(dir, out = []) {
   return out;
 }
 
+function findRelativeModuleSpecifiers(text) {
+  const specifiers = new Set();
+  for (const pattern of [
+    /(?:\bfrom\s*|\bimport\s*\()\s*["']([^"']+)["']/gu,
+    /\bimport\s*["']([^"']+)["']/gu,
+  ]) {
+    for (const match of text.matchAll(pattern)) {
+      const specifier = match[1];
+      if (specifier?.startsWith(".")) {
+        specifiers.add(specifier);
+      }
+    }
+  }
+  return [...specifiers];
+}
+
+function isPathWithin(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`) && relative !== "..")
+  );
+}
+
 for (const relativePath of walk("scripts/e2e")) {
   if (!/\.(?:sh|ts|mjs|js)$/u.test(relativePath)) {
     continue;
   }
   const text = readText(relativePath);
-  if (/from\s+["']\.\.\/\.\.\/src\//u.test(text) || /import\(["']\.\.\/\.\.\/src\//u.test(text)) {
-    errors.push(`${relativePath}: Docker E2E harness must import built dist, not ../../src`);
+  const sourceImport = findRelativeModuleSpecifiers(text).find((specifier) => {
+    const resolved = path.resolve(ROOT_DIR, path.dirname(relativePath), specifier);
+    return isPathWithin(path.join(ROOT_DIR, "src"), resolved);
+  });
+  if (sourceImport) {
+    errors.push(
+      `${relativePath}: Docker E2E harness must import package exports, not ${sourceImport}`,
+    );
   }
   if (/-v\s+["']?\$ROOT_DIR:\/app(?::|["'\s]|$)/u.test(text)) {
     errors.push(`${relativePath}: do not mount the repo root as /app in Docker E2E`);
@@ -58,6 +111,8 @@ function validateUniqueLanes(label, lanes) {
 }
 
 function validateLane(label, lane) {
+  const resources = laneResources(lane);
+  const sourceCheckoutImageLane = sourceCheckoutImageLanes.has(lane.name);
   if (!lane.name || typeof lane.name !== "string") {
     errors.push(`${label}: Docker E2E lane is missing a string name`);
   }
@@ -70,16 +125,21 @@ function validateLane(label, lane) {
       `${label}: Docker E2E lane '${lane.name}' has invalid image kind '${lane.e2eImageKind}'`,
     );
   }
-  if (lane.live && lane.e2eImageKind) {
+  if (lane.live && lane.e2eImageKind && !livePackageBackedLanes.has(lane.name)) {
     errors.push(`${label}: live Docker E2E lane '${lane.name}' must not require a package image`);
   }
-  if (!lane.live && !lane.e2eImageKind) {
+  if (!lane.live && !lane.e2eImageKind && !sourceCheckoutImageLane) {
     errors.push(`${label}: package Docker E2E lane '${lane.name}' must declare an e2e image kind`);
+  }
+  if (sourceCheckoutImageLane && !/\bOPENCLAW_SKIP_DOCKER_BUILD=0\b/u.test(lane.command)) {
+    errors.push(
+      `${label}: source-checkout Docker E2E lane '${lane.name}' must force a local image build`,
+    );
   }
   if (laneWeight(lane) < 1) {
     errors.push(`${label}: Docker E2E lane '${lane.name}' must have positive weight`);
   }
-  if (!laneResources(lane).includes("docker")) {
+  if (!resources.includes("docker")) {
     errors.push(`${label}: Docker E2E lane '${lane.name}' must include the docker resource`);
   }
 
@@ -96,6 +156,7 @@ function validateLane(label, lane) {
 const releasePathLanes = allReleasePathLanes({ includeOpenWebUI: true });
 for (const [label, lanes] of [
   ["release-path", releasePathLanes],
+  ["public-installer", publicInstallerLanes],
   ["main", mainLanes],
   ["tail", tailLanes],
 ]) {

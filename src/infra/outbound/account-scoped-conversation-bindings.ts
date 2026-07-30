@@ -1,3 +1,7 @@
+import { isFutureDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
+import { resolveDefaultAgentId } from "../../agents/agent-scope-config.js";
+// Account-scoped conversation binding managers adapt channel-local thread maps
+// into the shared session binding service.
 import { resolveThreadBindingConversationIdFromBindingId } from "../../channels/thread-binding-id.js";
 import {
   resolveThreadBindingIdleTimeoutMsForChannel,
@@ -13,6 +17,7 @@ import {
   type SessionBindingRecord,
 } from "./session-binding-service.js";
 
+/** In-memory binding record scoped to one channel account and conversation id. */
 export type AccountScopedConversationBindingRecord<TKind extends string = string> = {
   accountId: string;
   conversationId: string;
@@ -25,6 +30,7 @@ export type AccountScopedConversationBindingRecord<TKind extends string = string
   lastActivityAt: number;
 };
 
+/** Account-local binding manager exposed by channel-specific conversation stores. */
 export type AccountScopedConversationBindingManager<TKind extends string = string> = {
   accountId: string;
   getByConversationId: (
@@ -115,6 +121,7 @@ function toSessionBindingRecord<TKind extends string>(params: {
   };
 }
 
+/** Creates a channel/account binding manager and registers it as a session-binding adapter. */
 export function createAccountScopedConversationBindingManager<TKind extends string>(params: {
   channel: string;
   cfg: OpenClawConfig;
@@ -127,6 +134,8 @@ export function createAccountScopedConversationBindingManager<TKind extends stri
   const state = getState<TKind>(params.stateKey);
   const existing = state.managersByAccountId.get(accountId);
   if (existing) {
+    // Manager state is account-scoped and process-global so repeated channel
+    // setup calls reuse the same binding adapter instead of double-registering.
     return existing;
   }
 
@@ -140,27 +149,52 @@ export function createAccountScopedConversationBindingManager<TKind extends stri
     channel: params.channel,
     accountId,
   });
+  const resolveActiveBinding = (
+    record: AccountScopedConversationBindingRecord<TKind> | undefined,
+    now = Date.now(),
+  ): AccountScopedConversationBindingRecord<TKind> | undefined => {
+    if (!record) {
+      return undefined;
+    }
+    const { expiresAt } = toSessionBindingRecord({
+      channel: params.channel,
+      record,
+      idleTimeoutMs,
+      maxAgeMs,
+      toSessionBindingTargetKind: params.toSessionBindingTargetKind,
+    });
+    if (expiresAt === undefined || isFutureDateTimestampMs(expiresAt, { nowMs: now })) {
+      return record;
+    }
 
-  let sessionBindingAdapter: SessionBindingAdapter;
+    // Prune at the account owner so SDK lookups and touches cannot revive stale bindings.
+    state.bindingsByAccountConversation.delete(
+      resolveBindingKey({ accountId, conversationId: record.conversationId }),
+    );
+    return undefined;
+  };
   const manager: AccountScopedConversationBindingManager<TKind> = {
     accountId,
     getByConversationId: (conversationId) =>
-      getState<TKind>(params.stateKey).bindingsByAccountConversation.get(
-        resolveBindingKey({ accountId, conversationId }),
+      resolveActiveBinding(
+        state.bindingsByAccountConversation.get(resolveBindingKey({ accountId, conversationId })),
       ),
-    listBySessionKey: (targetSessionKey) =>
-      [...getState<TKind>(params.stateKey).bindingsByAccountConversation.values()].filter(
-        (record) => record.accountId === accountId && record.targetSessionKey === targetSessionKey,
-      ),
+    listBySessionKey: (targetSessionKey) => {
+      const now = Date.now();
+      return [...state.bindingsByAccountConversation.values()].filter(
+        (record) =>
+          record.accountId === accountId &&
+          record.targetSessionKey === targetSessionKey &&
+          resolveActiveBinding(record, now) !== undefined,
+      );
+    },
     bindConversation: ({ conversationId, targetKind, targetSessionKey, metadata }) => {
       const normalizedConversationId = conversationId.trim();
       const normalizedTargetSessionKey = targetSessionKey.trim();
       if (!normalizedConversationId || !normalizedTargetSessionKey) {
         return null;
       }
-      const existing = getState<TKind>(params.stateKey).bindingsByAccountConversation.get(
-        resolveBindingKey({ accountId, conversationId: normalizedConversationId }),
-      );
+      const existingLocal = manager.getByConversationId(normalizedConversationId);
       const now = Date.now();
       const record: AccountScopedConversationBindingRecord<TKind> = {
         accountId,
@@ -170,15 +204,19 @@ export function createAccountScopedConversationBindingManager<TKind extends stri
         agentId:
           typeof metadata?.agentId === "string" && metadata.agentId.trim()
             ? metadata.agentId.trim()
-            : (existing?.agentId ?? resolveAgentIdFromSessionKey(normalizedTargetSessionKey)),
+            : (existingLocal?.agentId ??
+              resolveAgentIdFromSessionKey(
+                normalizedTargetSessionKey,
+                resolveDefaultAgentId(params.cfg),
+              )),
         label:
           typeof metadata?.label === "string" && metadata.label.trim()
             ? metadata.label.trim()
-            : existing?.label,
+            : existingLocal?.label,
         boundBy:
           typeof metadata?.boundBy === "string" && metadata.boundBy.trim()
             ? metadata.boundBy.trim()
-            : existing?.boundBy,
+            : existingLocal?.boundBy,
         boundAt: now,
         lastActivityAt: now,
       };
@@ -190,9 +228,7 @@ export function createAccountScopedConversationBindingManager<TKind extends stri
     },
     touchConversation: (conversationId, at = Date.now()) => {
       const key = resolveBindingKey({ accountId, conversationId });
-      const existingRecord = getState<TKind>(params.stateKey).bindingsByAccountConversation.get(
-        key,
-      );
+      const existingRecord = manager.getByConversationId(conversationId);
       if (!existingRecord) {
         return null;
       }
@@ -241,7 +277,7 @@ export function createAccountScopedConversationBindingManager<TKind extends stri
     },
   };
 
-  sessionBindingAdapter = {
+  const sessionBindingAdapter: SessionBindingAdapter = {
     channel: params.channel,
     accountId,
     capabilities: {
@@ -340,6 +376,7 @@ export function createAccountScopedConversationBindingManager<TKind extends stri
   return manager;
 }
 
+/** Stops registered managers and clears account-scoped binding state for one test key. */
 export function resetAccountScopedConversationBindingsForTests(params: { stateKey: symbol }) {
   const state = getState(params.stateKey);
   for (const manager of state.managersByAccountId.values()) {

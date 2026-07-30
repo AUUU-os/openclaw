@@ -1,93 +1,84 @@
+import { resolvePublishedModelCatalogOwner } from "../agents/prepared-model-catalog-owner.js";
+import type { PublishedModelCatalogOwnerCandidate } from "../agents/prepared-model-catalog.types.js";
+// Gateway catalog reads use the atomic prepared runtime generation.
 import { getRuntimeConfig } from "../config/io.js";
+import type {
+  GatewayModelCatalogOwnerSnapshot,
+  GatewayModelCatalogSnapshot,
+} from "./server-model-catalog.types.js";
 
 export type GatewayModelChoice = import("../agents/model-catalog.js").ModelCatalogEntry;
+export type { GatewayModelCatalogSnapshot } from "./server-model-catalog.types.js";
 
 type GatewayModelCatalogConfig = ReturnType<typeof getRuntimeConfig>;
-type LoadModelCatalog = (params: {
+type LoadPublishedPreparedModelCatalogOwnerSnapshot = (params: {
+  agentId?: string;
+  agentDir?: string;
   config: GatewayModelCatalogConfig;
-}) => Promise<GatewayModelChoice[]>;
+  readOnly?: boolean;
+  workspaceDir?: string;
+}) => Promise<PublishedModelCatalogOwnerCandidate>;
 type LoadGatewayModelCatalogParams = {
+  agentId?: string;
+  agentDir?: string;
   getConfig?: () => GatewayModelCatalogConfig;
-  loadModelCatalog?: LoadModelCatalog;
+  loadPublishedPreparedModelCatalogOwnerSnapshot?: LoadPublishedPreparedModelCatalogOwnerSnapshot;
+  readOnly?: boolean;
+  workspaceDir?: string;
 };
 
-let lastSuccessfulCatalog: GatewayModelChoice[] | null = null;
-let inFlightRefresh: Promise<GatewayModelChoice[]> | null = null;
-let staleGeneration = 0;
-let appliedGeneration = 0;
-
-function resetGatewayModelCatalogState(): void {
-  lastSuccessfulCatalog = null;
-  inFlightRefresh = null;
-  staleGeneration = 0;
-  appliedGeneration = 0;
-}
-
-function isGatewayModelCatalogStale(): boolean {
-  return appliedGeneration < staleGeneration;
-}
-
-async function resolveLoadModelCatalog(
+async function resolveLoader(
   params?: LoadGatewayModelCatalogParams,
-): Promise<LoadModelCatalog> {
-  if (params?.loadModelCatalog) {
-    return params.loadModelCatalog;
+): Promise<LoadPublishedPreparedModelCatalogOwnerSnapshot> {
+  if (params?.loadPublishedPreparedModelCatalogOwnerSnapshot) {
+    return params.loadPublishedPreparedModelCatalogOwnerSnapshot;
   }
-  const { loadModelCatalog } = await import("../agents/model-catalog.js");
-  return loadModelCatalog;
+  const { loadPublishedPreparedModelCatalogOwnerSnapshot } =
+    await import("../agents/prepared-model-catalog.js");
+  return loadPublishedPreparedModelCatalogOwnerSnapshot;
 }
 
-function startGatewayModelCatalogRefresh(
+// Isolated gateway tests share process module state with lifecycle-owner tests.
+export async function resetPreparedModelCatalogForTest(): Promise<void> {
+  const [{ resetPreparedModelRuntimeSnapshotsForTest }, { resetModelCatalogBuilderCacheForTest }] =
+    await Promise.all([
+      import("../agents/prepared-model-runtime.test-support.js"),
+      import("../agents/model-catalog.js"),
+    ]);
+  resetPreparedModelRuntimeSnapshotsForTest();
+  resetModelCatalogBuilderCacheForTest();
+}
+
+async function loadGatewayModelCatalogOwnerSnapshot(
   params?: LoadGatewayModelCatalogParams,
-): Promise<GatewayModelChoice[]> {
-  const config = (params?.getConfig ?? getRuntimeConfig)();
-  const refreshGeneration = staleGeneration;
-  const refresh = resolveLoadModelCatalog(params)
-    .then((loadModelCatalog) => loadModelCatalog({ config }))
-    .then((catalog) => {
-      if (catalog.length > 0 && refreshGeneration === staleGeneration) {
-        lastSuccessfulCatalog = catalog;
-        appliedGeneration = staleGeneration;
-      }
-      return catalog;
-    })
-    .finally(() => {
-      if (inFlightRefresh === refresh) {
-        inFlightRefresh = null;
-      }
-    });
-  inFlightRefresh = refresh;
-  return refresh;
+): Promise<GatewayModelCatalogOwnerSnapshot> {
+  const loadOwner = await resolveLoader(params);
+  return resolvePublishedModelCatalogOwner(
+    await loadOwner({
+      ...(params?.agentId ? { agentId: params.agentId } : {}),
+      ...(params?.agentDir ? { agentDir: params.agentDir } : {}),
+      config: (params?.getConfig ?? getRuntimeConfig)(),
+      readOnly: params?.readOnly !== false,
+      ...(params?.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
+    }),
+  );
 }
 
-export function markGatewayModelCatalogStaleForReload(): void {
-  staleGeneration += 1;
-}
-
-// Test-only escape hatch: model catalog is cached at module scope for the
-// process lifetime, which is fine for the real gateway daemon, but makes
-// isolated unit tests harder. Keep this intentionally obscure.
-export async function __resetModelCatalogCacheForTest(): Promise<void> {
-  resetGatewayModelCatalogState();
-  const { resetModelCatalogCacheForTest } = await import("../agents/model-catalog.js");
-  resetModelCatalogCacheForTest();
+export async function loadGatewayModelCatalogSnapshot(
+  params?: LoadGatewayModelCatalogParams,
+): Promise<GatewayModelCatalogSnapshot> {
+  const owner = await loadGatewayModelCatalogOwnerSnapshot(params);
+  return {
+    ...owner.modelCatalog,
+    agentId: owner.agentId,
+    agentDir: owner.agentDir,
+    workspaceDir: owner.workspaceDir,
+    config: owner.config,
+  };
 }
 
 export async function loadGatewayModelCatalog(
   params?: LoadGatewayModelCatalogParams,
 ): Promise<GatewayModelChoice[]> {
-  const isStale = isGatewayModelCatalogStale();
-  if (!isStale && lastSuccessfulCatalog) {
-    return lastSuccessfulCatalog;
-  }
-  if (isStale && lastSuccessfulCatalog) {
-    if (!inFlightRefresh) {
-      void startGatewayModelCatalogRefresh(params).catch(() => undefined);
-    }
-    return lastSuccessfulCatalog;
-  }
-  if (inFlightRefresh) {
-    return await inFlightRefresh;
-  }
-  return await startGatewayModelCatalogRefresh(params);
+  return (await loadGatewayModelCatalogSnapshot(params)).entries;
 }

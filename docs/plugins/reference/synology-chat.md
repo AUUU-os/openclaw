@@ -1,5 +1,5 @@
 ---
-summary: "Adds the Synology Chat channel surface for sending and receiving OpenClaw messages."
+summary: "Synology Chat channel plugin for OpenClaw channels and direct messages."
 read_when:
   - You are installing, configuring, or auditing the synology-chat plugin
 title: "Synology Chat plugin"
@@ -7,16 +7,16 @@ title: "Synology Chat plugin"
 
 # Synology Chat plugin
 
-Adds the Synology Chat channel surface for sending and receiving OpenClaw messages.
+Synology Chat channel plugin for OpenClaw channels and direct messages.
 
 ## Distribution
 
 - Package: `@openclaw/synology-chat`
-- Install route: ClawHub + npm
+- Install route: npm; ClawHub
 
 ## Surface
 
-channels: synology-chat
+channels: `synology-chat`
 
 ## Related docs
 

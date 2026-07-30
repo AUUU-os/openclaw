@@ -1,4 +1,5 @@
-import { createDraftStreamLoop } from "openclaw/plugin-sdk/channel-lifecycle";
+// Matrix plugin module implements draft stream behavior.
+import { createDraftStreamLoop } from "openclaw/plugin-sdk/channel-outbound";
 import type { CoreConfig } from "../types.js";
 import type { MatrixClient } from "./sdk.js";
 import { editMessageMatrix, prepareMatrixSingleText, sendSingleTextMessageMatrix } from "./send.js";
@@ -17,12 +18,15 @@ function resolveDraftPreviewOptions(mode: MatrixDraftPreviewMode): {
       includeMentions: false,
     };
   }
+  // Drafts can contain partial model text and raw tool-progress paths; keep
+  // Matrix mentions inert until callers send a normal final message.
   return {
     msgtype: MsgType.Text,
+    includeMentions: false,
   };
 }
 
-export type MatrixDraftStream = {
+type MatrixDraftStream = {
   /** Update the draft with the latest accumulated text for the current block. */
   update: (text: string) => void;
   /** Ensure the last pending update has been sent. */
@@ -37,6 +41,8 @@ export type MatrixDraftStream = {
   reset: () => void;
   /** The event ID of the current draft message, if any. */
   eventId: () => string | undefined;
+  /** The last content accepted for the current draft event, if any. */
+  content: () => string | undefined;
   /** True when the provided text matches the last rendered draft payload. */
   matchesPreparedText: (text: string) => boolean;
   /** True when preview streaming must fall back to normal final delivery. */
@@ -64,6 +70,7 @@ export function createMatrixDraftStream(params: {
 
   let currentEventId: string | undefined;
   let lastSentText = "";
+  let lastSentContent = "";
   let stopped = false;
   let sendFailed = false;
   let finalizeInPlaceBlocked = false;
@@ -107,6 +114,7 @@ export function createMatrixDraftStream(params: {
         });
         currentEventId = result.messageId;
         lastSentText = preparedText.trimmedText;
+        lastSentContent = preparedText.convertedText;
         log?.(`draft-stream: created message ${currentEventId}${useLive ? " (MSC4357 live)" : ""}`);
       } else {
         await editMessageMatrix(roomId, currentEventId, preparedText.trimmedText, {
@@ -119,6 +127,7 @@ export function createMatrixDraftStream(params: {
           live: useLive,
         });
         lastSentText = preparedText.trimmedText;
+        lastSentContent = preparedText.convertedText;
       }
       return true;
     } catch (err) {
@@ -194,6 +203,7 @@ export function createMatrixDraftStream(params: {
     replyToId = params.preserveReplyId ? params.replyToId : undefined;
     currentEventId = undefined;
     lastSentText = "";
+    lastSentContent = "";
     stopped = false;
     sendFailed = false;
     finalizeInPlaceBlocked = false;
@@ -215,6 +225,7 @@ export function createMatrixDraftStream(params: {
     finalizeLive,
     reset,
     eventId: () => currentEventId,
+    content: () => lastSentContent || undefined,
     matchesPreparedText: (text: string) =>
       prepareMatrixSingleText(text, {
         cfg,

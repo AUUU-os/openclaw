@@ -1,7 +1,11 @@
+/**
+ * Tests bundled plugin facade loader resolution and activation checks.
+ */
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { withMockedWindowsPlatform } from "../test-utils/vitest-spies.js";
 import {
   listImportedBundledPluginFacadeIds,
   loadBundledPluginPublicSurfaceModuleSync,
@@ -56,11 +60,15 @@ function createTrustedBundledPluginsRoot(kind: "dist" | "dist-runtime" = "dist")
   return rootDir;
 }
 
-function writeFixturePackageJson(pluginRoot: string, pluginId: string): void {
+function writeFixturePackageJson(
+  pluginRoot: string,
+  pluginId: string,
+  type: "commonjs" | "module" = "module",
+): void {
   writeJsonFile(path.join(pluginRoot, "package.json"), {
     name: `@openclaw/${pluginId}`,
     version: "0.0.0",
-    type: "module",
+    type,
   });
 }
 
@@ -108,7 +116,7 @@ function createThrowingPluginFixture(prefix: string): TrustedBundledPluginFixtur
   const pluginRoot = path.join(bundledPluginsDir, pluginId);
   fs.mkdirSync(pluginRoot, { recursive: true });
   trustedBundledPluginFixtureRoots.push(pluginRoot);
-  writeFixturePackageJson(pluginRoot, pluginId);
+  writeFixturePackageJson(pluginRoot, pluginId, "commonjs");
   fs.writeFileSync(
     path.join(pluginRoot, "api.js"),
     'throw new Error("plugin load failure");\n',
@@ -140,7 +148,7 @@ function createCircularPluginFixture(prefix: string): TrustedBundledPluginFixtur
   );
   fs.writeFileSync(
     path.join(pluginRoot, "helper.js"),
-    ['import { marker } from "../facade.mjs";', "export const circularMarker = marker;", ""].join(
+    ['import { marker } from "./facade.mjs";', "export const circularMarker = marker;", ""].join(
       "\n",
     ),
     "utf8",
@@ -274,21 +282,21 @@ describe("plugin-sdk facade loader", () => {
         marker: "jiti-fallback",
       })) as unknown as ReturnType<FacadeLoaderSourceTransformFactory>;
     }) as FacadeLoaderSourceTransformFactory);
-    const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
     const restoreVersions = forceNodeRuntimeVersionsForTest();
 
-    try {
-      expect(
-        loadBundledPluginPublicSurfaceModuleSync<{ marker: string }>({
-          dirName: fixture.pluginId,
-          artifactBasename: "api.js",
-        }).marker,
-      ).toBe("windows-dist-ok");
-      expect(createJitiCalls).toHaveLength(0);
-    } finally {
-      restoreVersions();
-      platformSpy.mockRestore();
-    }
+    withMockedWindowsPlatform(() => {
+      try {
+        expect(
+          loadBundledPluginPublicSurfaceModuleSync<{ marker: string }>({
+            dirName: fixture.pluginId,
+            artifactBasename: "api.js",
+          }).marker,
+        ).toBe("windows-dist-ok");
+        expect(createJitiCalls).toHaveLength(0);
+      } finally {
+        restoreVersions();
+      }
+    });
   });
 
   it("breaks circular facade re-entry during module evaluation", () => {
@@ -316,7 +324,7 @@ describe("plugin-sdk facade loader", () => {
       }),
     ).toThrow("plugin load failure");
 
-    expect(listImportedBundledPluginFacadeIds()).toEqual([]);
+    expect(listImportedBundledPluginFacadeIds()).toStrictEqual([]);
 
     expect(() =>
       loadBundledPluginPublicSurfaceModuleSync<{ marker: string }>({

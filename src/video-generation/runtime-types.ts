@@ -1,3 +1,4 @@
+// Video runtime types describe auth and provider execution dependencies.
 import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import type { FallbackAttempt } from "../agents/model-fallback.types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -5,7 +6,6 @@ import type {
   GeneratedVideoAsset,
   VideoGenerationIgnoredOverride,
   VideoGenerationNormalization,
-  VideoGenerationProvider,
   VideoGenerationResolution,
   VideoGenerationSourceAsset,
 } from "./types.js";
@@ -25,6 +25,7 @@ export type GenerateVideoParams = {
   inputImages?: VideoGenerationSourceAsset[];
   inputVideos?: VideoGenerationSourceAsset[];
   inputAudios?: VideoGenerationSourceAsset[];
+  autoProviderFallback?: boolean;
   /** Arbitrary provider-specific options forwarded as-is to provider.generateVideo. */
   providerOptions?: Record<string, unknown>;
   /** Optional per-request provider timeout in milliseconds. */
@@ -40,9 +41,3 @@ export type GenerateVideoRuntimeResult = {
   metadata?: Record<string, unknown>;
   ignoredOverrides: VideoGenerationIgnoredOverride[];
 };
-
-export type ListRuntimeVideoGenerationProvidersParams = {
-  config?: OpenClawConfig;
-};
-
-export type RuntimeVideoGenerationProvider = VideoGenerationProvider;

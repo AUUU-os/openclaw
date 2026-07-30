@@ -1,3 +1,4 @@
+// CommonJS fixture server for ClawHub package/install E2E scenarios.
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
@@ -87,10 +88,10 @@ async function buildNpmPackArtifact(fixture) {
 
 const profiles = {
   "kitchen-sink-plugin": {
-    version: "0.1.3",
+    version: "0.2.5",
     packageJson: {
       name: packageName,
-      version: "0.1.3",
+      version: "0.2.5",
       type: "module",
       dependencies: {
         "is-number": "7.0.0",
@@ -127,6 +128,28 @@ export default definePluginEntry({
       docsPath: "/providers/kitchen-sink",
       auth: [],
     });
+    api.registerContextEngine("${pluginId}", () => ({
+      info: {
+        id: "${pluginId}",
+        name: "Kitchen Sink Context Engine",
+      },
+      async ingest() {
+        return { ingested: false };
+      },
+      async assemble(params) {
+        return {
+          messages: params.messages,
+          estimatedTokens: 0,
+        };
+      },
+      async compact() {
+        return {
+          ok: true,
+          compacted: false,
+          reason: "kitchen-sink fixture does not compact",
+        };
+      },
+    }));
     api.registerChannel({
       plugin: {
         id: "kitchen-sink-channel",
@@ -151,7 +174,32 @@ export default definePluginEntry({
     manifest: {
       id: pluginId,
       name: "OpenClaw Kitchen Sink",
+      kind: "context-engine",
       channels: ["kitchen-sink-channel"],
+      channelConfigs: {
+        "kitchen-sink-channel": {
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              enabled: { type: "boolean", default: true },
+              token: { type: "string" },
+            },
+          },
+          uiHints: {
+            token: {
+              sensitive: true,
+            },
+          },
+          label: "Kitchen Sink",
+          description:
+            "Credential-free channel fixture for deterministic Kitchen Sink install tests.",
+          commands: {
+            nativeCommandsAutoEnabled: true,
+            nativeSkillsAutoEnabled: true,
+          },
+        },
+      },
       providers: ["kitchen-sink-provider"],
       contracts: {
         tools: ["kitchen-sink-tool"],
@@ -249,7 +297,7 @@ export default definePluginEntry({
   name: "OpenClaw Kitchen Sink",
   description: "Docker E2E kitchen-sink plugin fixture",
   register(api) {
-    api.on("before_agent_start", async (event, context) => ({
+    api.on("before_prompt_build", async (event, context) => ({
       kitchenSink: true,
       observedEventKeys: Object.keys(event || {}),
       observedContextKeys: Object.keys(context || {}),
@@ -338,6 +386,37 @@ async function main() {
     response.writeHead(status, { "content-type": "application/json" });
     response.end(`${JSON.stringify(value)}\n`);
   };
+  const artifactResolverDetail = {
+    package: versionDetail.package ?? {
+      name: packageName,
+      displayName: packageDetail.package?.displayName ?? "OpenClaw Kitchen Sink",
+      family: packageDetail.package?.family ?? "code-plugin",
+    },
+    version: versionDetail.version,
+    artifact: {
+      source: "clawhub",
+      artifactKind: "npm-pack",
+      packageName,
+      version: fixture.version,
+      artifactSha256: clawpack.clawpackSha256,
+      npmIntegrity: clawpack.npmIntegrity,
+      npmShasum: clawpack.npmShasum,
+    },
+  };
+  const securityDetail = {
+    package: artifactResolverDetail.package,
+    release: {
+      version: fixture.version,
+    },
+    trust: {
+      scanStatus: "clean",
+      moderationState: null,
+      blockedFromDownload: false,
+      reasons: [],
+      pending: false,
+      stale: false,
+    },
+  };
 
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
@@ -355,6 +434,20 @@ async function main() {
       `/api/v1/packages/${encodeURIComponent(packageName)}/versions/${fixture.version}`
     ) {
       json(response, versionDetail);
+      return;
+    }
+    if (
+      url.pathname ===
+      `/api/v1/packages/${encodeURIComponent(packageName)}/versions/${fixture.version}/artifact`
+    ) {
+      json(response, artifactResolverDetail);
+      return;
+    }
+    if (
+      url.pathname ===
+      `/api/v1/packages/${encodeURIComponent(packageName)}/versions/${fixture.version}/security`
+    ) {
+      json(response, securityDetail);
       return;
     }
     if (
@@ -396,7 +489,9 @@ async function main() {
   });
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+main().catch(
+  /** @param {unknown} error */ (error) => {
+    console.error(error);
+    process.exit(1);
+  },
+);

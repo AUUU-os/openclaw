@@ -1,24 +1,40 @@
+// Gateway tool invocation engine.
+// Shared implementation behind HTTP and RPC tool invocation adapters.
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { runBeforeToolCallHook } from "../agents/agent-tools.before-tool-call.js";
+import { resolveToolLoopDetectionConfig } from "../agents/agent-tools.js";
 import { getChannelAgentToolMeta } from "../agents/channel-tools.js";
-import { runBeforeToolCallHook } from "../agents/pi-tools.before-tool-call.js";
-import { resolveToolLoopDetectionConfig } from "../agents/pi-tools.js";
 import { isKnownCoreToolId } from "../agents/tool-catalog.js";
-import { applyOwnerOnlyToolPolicy } from "../agents/tool-policy.js";
+import {
+  AUTOMATIONS_TOOL_NAME,
+  isAutomationsToolName,
+} from "../agents/tools/automations-tool-name.js";
 import { ToolInputError, type AnyAgentTool } from "../agents/tools/common.js";
+import {
+  normalizeConversationReadInvocationOrigin,
+  type ConversationReadInvocationOrigin,
+} from "../channels/plugins/conversation-read-origin.js";
 import { resolveMainSessionKey } from "../config/sessions.js";
+import { resolveSessionEntryAccessTarget } from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { logWarn } from "../logger.js";
 import { isTestDefaultMemorySlotDisabled } from "../plugins/config-state.js";
 import { defaultSlotIdForKey } from "../plugins/slots.js";
 import { getPluginToolMeta } from "../plugins/tools.js";
 import {
-  normalizeOptionalLowercaseString,
-  normalizeOptionalString,
-} from "../shared/string-coerce.js";
+  AGENT_HARNESS_SESSION_KEY_RESERVED_MESSAGE,
+  isAgentHarnessSessionKey,
+  isAgentHarnessSessionStoreEntryProtected,
+} from "../sessions/agent-harness-session-key.js";
 import { canonicalizeSessionKeyForAgent } from "./session-store-key.js";
 import { resolveGatewayScopedTools } from "./tool-resolution.js";
 
 const MEMORY_TOOL_NAMES = new Set(["memory_search", "memory_get"]);
 
+/** Protocol input shape accepted by gateway tool invocation surfaces. */
 export type ToolsInvokeInput = {
   tool?: unknown;
   name?: unknown;
@@ -144,18 +160,31 @@ function resolveToolSource(tool: AnyAgentTool): "core" | "plugin" | "channel" {
   return "core";
 }
 
+/** Resolves, authorizes, and invokes one gateway-visible core/plugin/channel tool. */
 export async function invokeGatewayTool(params: {
   cfg: OpenClawConfig;
   input: ToolsInvokeInput;
-  senderIsOwner: boolean;
   messageChannel?: string;
   accountId?: string;
   agentTo?: string;
   agentThreadId?: string;
+  senderIsOwner?: boolean;
+  clientCaps?: string[];
+  conversationReadOrigin?: ConversationReadInvocationOrigin;
   toolCallIdPrefix: string;
   approvalMode?: "request" | "report";
+  signal?: AbortSignal;
 }): Promise<ToolsInvokeOutcome> {
-  const toolName = normalizeOptionalString(params.input.name ?? params.input.tool) ?? "";
+  const conversationReadOrigin = normalizeConversationReadInvocationOrigin(
+    params.conversationReadOrigin,
+  );
+  const requestedToolName = normalizeOptionalString(params.input.name ?? params.input.tool) ?? "";
+  // "cron" is a permanently accepted inbound alias for the scheduler tool
+  // (owner decision, RFC 0026; same contract as bash -> exec). Canonicalize
+  // before core-id checks and exact-name dispatch below.
+  const toolName = isAutomationsToolName(requestedToolName)
+    ? AUTOMATIONS_TOOL_NAME
+    : requestedToolName;
   if (!toolName) {
     return {
       ok: false,
@@ -183,6 +212,9 @@ export async function invokeGatewayTool(params: {
     }
   }
 
+  const knownCoreTool = isKnownCoreToolId(toolName);
+  const gatewayRequestedTools = knownCoreTool ? [] : [toolName];
+
   const action = normalizeOptionalString(params.input.action);
   const argsRaw = params.input.args;
   const args =
@@ -190,6 +222,23 @@ export async function invokeGatewayTool(params: {
       ? (argsRaw as Record<string, unknown>)
       : {};
   const sessionKey = resolveSessionKey({ cfg: params.cfg, input: params.input });
+  const harnessEntry = isAgentHarnessSessionKey(sessionKey)
+    ? resolveSessionEntryAccessTarget({ cfg: params.cfg, sessionKey }).entry
+    : undefined;
+  if (
+    isAgentHarnessSessionKey(sessionKey) &&
+    (!harnessEntry || isAgentHarnessSessionStoreEntryProtected(sessionKey, harnessEntry))
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      toolName,
+      error: {
+        type: "invalid_request",
+        message: AGENT_HARNESS_SESSION_KEY_RESERVED_MESSAGE,
+      },
+    };
+  }
   const resolveTools = (disablePluginTools: boolean) =>
     resolveGatewayScopedTools({
       cfg: params.cfg,
@@ -198,17 +247,19 @@ export async function invokeGatewayTool(params: {
       accountId: params.accountId,
       agentTo: params.agentTo,
       agentThreadId: params.agentThreadId,
+      senderIsOwner: params.senderIsOwner,
+      clientCaps: params.clientCaps,
+      conversationReadOrigin,
       allowGatewaySubagentBinding: true,
       allowMediaInvokeCommands: true,
       surface: "http",
       disablePluginTools,
-      senderIsOwner: params.senderIsOwner,
+      gatewayRequestedTools,
     });
 
-  const knownCoreTool = isKnownCoreToolId(toolName);
-  let { agentId, tools } = resolveTools(knownCoreTool);
+  let { agentId, tools, workspaceDir } = resolveTools(knownCoreTool);
   if (knownCoreTool && !tools.some((candidate) => candidate.name === toolName)) {
-    ({ agentId, tools } = resolveTools(false));
+    ({ agentId, tools, workspaceDir } = resolveTools(false));
   }
   const requestedAgentId = normalizeOptionalString(params.input.agentId);
   if (requestedAgentId && agentId && requestedAgentId !== agentId) {
@@ -222,9 +273,7 @@ export async function invokeGatewayTool(params: {
       },
     };
   }
-  const tool = applyOwnerOnlyToolPolicy(tools, params.senderIsOwner).find(
-    (candidate) => candidate.name === toolName,
-  );
+  const tool = tools.find((candidate) => candidate.name === toolName);
   if (!tool) {
     return {
       ok: false,
@@ -238,8 +287,8 @@ export async function invokeGatewayTool(params: {
     const gatewayTool: AnyAgentTool = tool;
     const idempotencyKey = normalizeOptionalString(params.input.idempotencyKey);
     const toolCallId = idempotencyKey
-      ? `${params.toolCallIdPrefix}-${idempotencyKey}`
-      : `${params.toolCallIdPrefix}-${Date.now()}`;
+      ? `${params.toolCallIdPrefix}-${conversationReadOrigin}-${idempotencyKey}`
+      : `${params.toolCallIdPrefix}-${conversationReadOrigin}-${Date.now()}`;
     const toolArgs = mergeActionIntoArgsIfSupported({
       toolSchema: gatewayTool.parameters,
       action,
@@ -251,9 +300,12 @@ export async function invokeGatewayTool(params: {
       toolCallId,
       ctx: {
         agentId,
+        config: params.cfg,
         sessionKey,
+        workspaceDir,
         loopDetection: resolveToolLoopDetectionConfig({ cfg: params.cfg, agentId }),
       },
+      signal: params.signal,
       approvalMode: params.approvalMode,
     });
     if (hookResult.blocked) {
@@ -268,12 +320,13 @@ export async function invokeGatewayTool(params: {
         },
       };
     }
+    params.signal?.throwIfAborted();
     return {
       ok: true,
       status: 200,
       toolName,
       source: resolveToolSource(gatewayTool),
-      result: await gatewayTool.execute?.(toolCallId, hookResult.params),
+      result: await gatewayTool.execute?.(toolCallId, hookResult.params, params.signal),
     };
   } catch (err) {
     const inputStatus = resolveToolInputErrorStatus(err);
@@ -288,7 +341,9 @@ export async function invokeGatewayTool(params: {
         },
       };
     }
-    logWarn(`tools-invoke: tool execution failed: ${String(err)}`);
+    if (!params.signal?.aborted) {
+      logWarn(`tools-invoke: tool execution failed: ${String(err)}`);
+    }
     return {
       ok: false,
       status: 500,

@@ -1,5 +1,5 @@
 ---
-summary: "Read-only diff viewer and file renderer for agents."
+summary: "OpenClaw read-only diff viewer plugin and file renderer for agents."
 read_when:
   - You are installing, configuring, or auditing the diffs plugin
 title: "Diffs plugin"
@@ -7,13 +7,13 @@ title: "Diffs plugin"
 
 # Diffs plugin
 
-Read-only diff viewer and file renderer for agents.
+OpenClaw read-only diff viewer plugin and file renderer for agents.
 
 ## Distribution
 
 - Package: `@openclaw/diffs`
-- Install route: ClawHub + npm
+- Install route: npm; ClawHub
 
 ## Surface
 
-contracts: tools; skills
+contracts: `tools`; skills

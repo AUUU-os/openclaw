@@ -1,34 +1,64 @@
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+// Bench Gateway Startup script supports OpenClaw repository automation.
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { request } from "node:http";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
+import { pathToFileURL } from "node:url";
+import { expectDefined } from "../packages/normalization-core/src/expect.js";
+import { parseStrictIntegerOption } from "./lib/dev-tooling-safety.ts";
+import { delay, stopChild } from "./lib/gateway-bench-child.ts";
+import {
+  getFreePort,
+  parseProcessRssKb,
+  readProcessRssMb,
+  readProcessTreeCpuMs,
+  requestProbeStatus,
+} from "./lib/gateway-bench-probes.ts";
+import { selectSlowStartupTraceDurations } from "./lib/gateway-startup-trace-ranking.js";
 
 type GatewayBenchCase = {
+  agentTopology?: "single" | "shared-eleven-plus-distinct-one";
+  completionTracePhase?: string;
   config: Record<string, unknown>;
   env?: Record<string, string>;
   id: string;
   name: string;
   pluginActivationOnStartup?: boolean;
   pluginCount?: number;
+  providerCatalogStallMs?: number;
+  providerStaticCatalogModelCount?: number;
+  providerStaticCatalogStallMs?: number;
 };
 
 type ProbeResult = {
+  firstErrorKind: string | null;
+  firstRecoveryMs: number | null;
   ms: number | null;
+  status: number | null;
+  transitions: ProbeTransition[];
+};
+
+type ProbeTransition = {
+  errorKind?: string;
+  ms: number;
   status: number | null;
 };
 
 type GatewaySample = {
+  completionMs: number | null;
   cpuCoreRatio: number | null;
   cpuMs: number | null;
+  exitedBeforeTeardown?: boolean;
   exitCode: number | null;
   firstOutputMs: number | null;
+  gatewayReadyLogLine: string | null;
+  gatewayReadyLogMs: number | null;
   healthz: ProbeResult;
+  httpListenLogLine: string | null;
+  httpListenLogMs: number | null;
   maxRssMb: number | null;
   outputTail: string;
-  readyLogMs: number | null;
   readyz: ProbeResult;
   signal: string | null;
   startupTrace: Record<string, number>;
@@ -47,20 +77,35 @@ type CaseResult = {
   name: string;
   samples: GatewaySample[];
   summary: {
+    completionMs: SummaryStats | null;
     firstOutputMs: SummaryStats | null;
     cpuCoreRatio: SummaryStats | null;
     cpuMs: SummaryStats | null;
+    gatewayReadyLogMs: SummaryStats | null;
     healthzMs: SummaryStats | null;
+    httpListenLogMs: SummaryStats | null;
     maxRssMb: SummaryStats | null;
-    readyLogMs: SummaryStats | null;
     readyzMs: SummaryStats | null;
     startupTrace: Record<string, SummaryStats>;
   };
 };
 
+type BenchmarkFailure = {
+  id: string;
+  reason: string;
+  sampleIndex: number;
+};
+
+type PluginFixtureResult = {
+  pluginIds: string[];
+  pluginsDir: string;
+};
+
 type CliOptions = {
   cases: GatewayBenchCase[];
+  cpuProfDir?: string;
   entry: string;
+  heapProfDir?: string;
   json: boolean;
   output?: string;
   runs: number;
@@ -72,6 +117,21 @@ const DEFAULT_RUNS = 5;
 const DEFAULT_WARMUP = 1;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_ENTRY = "dist/entry.js";
+const BOOLEAN_FLAGS = new Set(["--help", "-h", "--json"]);
+const VALUE_FLAGS = new Set([
+  "--case",
+  "--cpu-prof-dir",
+  "--entry",
+  "--heap-prof-dir",
+  "--output",
+  "--runs",
+  "--timeout-ms",
+  "--warmup",
+]);
+
+class CliArgumentError extends Error {
+  override name = "CliArgumentError";
+}
 
 const BASE_CONFIG = {
   browser: { enabled: false },
@@ -90,6 +150,9 @@ const BASE_CONFIG = {
   },
 } satisfies Record<string, unknown>;
 
+const STALLED_CATALOG_PROVIDER_ID = "bench-catalog-stall";
+const STALLED_CATALOG_MODEL_ID = "bench-model";
+
 const GATEWAY_CASES: readonly GatewayBenchCase[] = [
   {
     id: "default",
@@ -101,6 +164,69 @@ const GATEWAY_CASES: readonly GatewayBenchCase[] = [
     name: "gateway, skip channels",
     env: { OPENCLAW_SKIP_CHANNELS: "1" },
     config: BASE_CONFIG,
+  },
+  {
+    id: "preparedRuntimeCatalogStall",
+    name: "gateway, prepared runtime with CPU-stalling live catalog",
+    env: { OPENCLAW_SKIP_CHANNELS: "1" },
+    providerCatalogStallMs: 2_000,
+    config: {
+      ...BASE_CONFIG,
+      agents: {
+        defaults: {
+          model: { primary: `${STALLED_CATALOG_PROVIDER_ID}/${STALLED_CATALOG_MODEL_ID}` },
+          models: {
+            [`${STALLED_CATALOG_PROVIDER_ID}/${STALLED_CATALOG_MODEL_ID}`]: {
+              agentRuntime: { id: "openclaw" },
+            },
+          },
+        },
+      },
+    },
+  },
+  {
+    id: "preparedRuntimeScaleOne",
+    name: "gateway, prepared runtime scale with one agent",
+    agentTopology: "single",
+    completionTracePhase: "sidecars.ready",
+    env: { OPENCLAW_SKIP_CHANNELS: "1" },
+    providerStaticCatalogModelCount: 64,
+    providerStaticCatalogStallMs: 100,
+    config: {
+      ...BASE_CONFIG,
+      agents: {
+        defaults: {
+          model: { primary: `${STALLED_CATALOG_PROVIDER_ID}/${STALLED_CATALOG_MODEL_ID}` },
+          models: {
+            [`${STALLED_CATALOG_PROVIDER_ID}/${STALLED_CATALOG_MODEL_ID}`]: {
+              agentRuntime: { id: "openclaw" },
+            },
+          },
+        },
+      },
+    },
+  },
+  {
+    id: "preparedRuntimeScaleMany",
+    name: "gateway, prepared runtime scale with 11 shared-workspace agents and one distinct",
+    agentTopology: "shared-eleven-plus-distinct-one",
+    completionTracePhase: "sidecars.ready",
+    env: { OPENCLAW_SKIP_CHANNELS: "1" },
+    providerStaticCatalogModelCount: 64,
+    providerStaticCatalogStallMs: 100,
+    config: {
+      ...BASE_CONFIG,
+      agents: {
+        defaults: {
+          model: { primary: `${STALLED_CATALOG_PROVIDER_ID}/${STALLED_CATALOG_MODEL_ID}` },
+          models: {
+            [`${STALLED_CATALOG_PROVIDER_ID}/${STALLED_CATALOG_MODEL_ID}`]: {
+              agentRuntime: { id: "openclaw" },
+            },
+          },
+        },
+      },
+    },
   },
   {
     id: "oneInternalHook",
@@ -134,6 +260,7 @@ const GATEWAY_CASES: readonly GatewayBenchCase[] = [
     id: "fiftyPlugins",
     name: "gateway, 50 manifest plugins",
     env: { OPENCLAW_SKIP_CHANNELS: "1" },
+    pluginActivationOnStartup: true,
     pluginCount: 50,
     config: BASE_CONFIG,
   },
@@ -147,42 +274,104 @@ const GATEWAY_CASES: readonly GatewayBenchCase[] = [
   },
 ] as const;
 
-function parseFlagValue(flag: string): string | undefined {
-  const index = process.argv.indexOf(flag);
-  if (index === -1) {
-    return undefined;
+function readRequiredFlagValue(argv: string[], index: number, flag: string): string {
+  const value = argv[index + 1];
+  if (!value || value.startsWith("-")) {
+    throw new CliArgumentError(`${flag} requires a value`);
   }
-  return process.argv[index + 1];
+  return value;
 }
 
-function hasFlag(flag: string): boolean {
-  return process.argv.includes(flag);
+function validateCliArgs(argv: string[]): void {
+  const seenSingleValueFlags = new Set<string>();
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index] ?? "";
+    if (BOOLEAN_FLAGS.has(arg)) {
+      continue;
+    }
+    if (VALUE_FLAGS.has(arg)) {
+      if (arg !== "--case") {
+        if (seenSingleValueFlags.has(arg)) {
+          throw new CliArgumentError(`${arg} was provided more than once`);
+        }
+        seenSingleValueFlags.add(arg);
+      }
+      readRequiredFlagValue(argv, index, arg);
+      index += 1;
+      continue;
+    }
+    throw new CliArgumentError(`Unknown argument: ${arg}`);
+  }
 }
 
-function parseRepeatableFlag(flag: string): string[] {
+function parseFlagValue(argv: string[], flag: string): string | undefined {
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === flag) {
+      return readRequiredFlagValue(argv, index, flag);
+    }
+  }
+  return undefined;
+}
+
+function hasFlag(argv: string[], flag: string): boolean {
+  return argv.includes(flag);
+}
+
+function hasHelpFlag(argv: string[]): boolean {
+  return hasFlag(argv, "--help") || hasFlag(argv, "-h");
+}
+
+function parseRepeatableFlag(argv: string[], flag: string): string[] {
   const values: string[] = [];
-  for (let index = 0; index < process.argv.length; index += 1) {
-    if (process.argv[index] === flag && process.argv[index + 1]) {
-      values.push(process.argv[index + 1]);
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === flag) {
+      values.push(readRequiredFlagValue(argv, index, flag));
+      index += 1;
     }
   }
   return values;
 }
 
-function parsePositiveInt(raw: string | undefined, fallback: number): number {
-  if (!raw) {
-    return fallback;
+function parsePositiveInt(raw: string | undefined, fallback: number, label: string): number {
+  return parseStrictIntegerOption({ fallback, label, min: 1, raw });
+}
+
+function parseNonNegativeInt(raw: string | undefined, fallback: number, label: string): number {
+  return parseStrictIntegerOption({ fallback, label, min: 0, raw });
+}
+
+function resolveEntry(raw: string | undefined): string {
+  const entry = raw?.trim() || DEFAULT_ENTRY;
+  if (entry.includes("\0")) {
+    throw new Error("--entry must not contain NUL bytes");
   }
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return fallback;
+  if (entry.startsWith("-")) {
+    throw new Error(`--entry must be a file path, not a Node option: ${JSON.stringify(entry)}`);
   }
-  return parsed;
+  return entry;
+}
+
+function resolveOutputPath(raw: string | undefined): string | undefined {
+  const output = raw?.trim();
+  if (!output) {
+    return undefined;
+  }
+  if (output.includes("\0")) {
+    throw new Error("--output must not contain NUL bytes");
+  }
+  return output;
 }
 
 function resolveCases(caseIds: string[]): GatewayBenchCase[] {
   if (caseIds.length === 0) {
     return [...GATEWAY_CASES];
+  }
+  const seenIds = new Set<string>();
+  for (const id of caseIds) {
+    if (seenIds.has(id)) {
+      throw new CliArgumentError(`Duplicate --case "${id}"`);
+    }
+    seenIds.add(id);
   }
   const byId = new Map(GATEWAY_CASES.map((benchCase) => [benchCase.id, benchCase]));
   return caseIds.map((id) => {
@@ -194,23 +383,58 @@ function resolveCases(caseIds: string[]): GatewayBenchCase[] {
   });
 }
 
-function parseOptions(): CliOptions {
+function parseOptions(argv: string[] = process.argv.slice(2)): CliOptions {
+  validateCliArgs(argv);
   return {
-    cases: resolveCases(parseRepeatableFlag("--case")),
-    entry: parseFlagValue("--entry") ?? DEFAULT_ENTRY,
-    json: hasFlag("--json"),
-    output: parseFlagValue("--output"),
-    runs: parsePositiveInt(parseFlagValue("--runs"), DEFAULT_RUNS),
-    timeoutMs: parsePositiveInt(parseFlagValue("--timeout-ms"), DEFAULT_TIMEOUT_MS),
-    warmup: parsePositiveInt(parseFlagValue("--warmup"), DEFAULT_WARMUP),
+    cases: resolveCases(parseRepeatableFlag(argv, "--case")),
+    cpuProfDir: parseFlagValue(argv, "--cpu-prof-dir"),
+    entry: resolveEntry(parseFlagValue(argv, "--entry")),
+    heapProfDir: parseFlagValue(argv, "--heap-prof-dir"),
+    json: hasFlag(argv, "--json"),
+    output: resolveOutputPath(parseFlagValue(argv, "--output")),
+    runs: parsePositiveInt(parseFlagValue(argv, "--runs"), DEFAULT_RUNS, "--runs"),
+    timeoutMs: parsePositiveInt(
+      parseFlagValue(argv, "--timeout-ms"),
+      DEFAULT_TIMEOUT_MS,
+      "--timeout-ms",
+    ),
+    warmup: parseNonNegativeInt(parseFlagValue(argv, "--warmup"), DEFAULT_WARMUP, "--warmup"),
   };
+}
+
+function printUsage(): void {
+  console.log(`OpenClaw Gateway startup benchmark
+
+Usage:
+  pnpm test:startup:gateway -- [options]
+  node --import tsx scripts/bench-gateway-startup.ts [options]
+
+Options:
+  --case <id>          Specific case id to run; repeatable
+  --entry <path>       Gateway CLI entry file (default: ${DEFAULT_ENTRY})
+  --runs <n>           Measured runs per case (default: ${DEFAULT_RUNS})
+  --warmup <n>         Warmup runs per case (default: ${DEFAULT_WARMUP})
+  --timeout-ms <ms>    Per-run timeout (default: ${DEFAULT_TIMEOUT_MS})
+  --cpu-prof-dir <dir> Write one V8 CPU profile per run
+  --heap-prof-dir <dir> Write one V8 heap profile per run
+  --output <path>      Write machine-readable JSON to a file
+  --json               Emit machine-readable JSON
+  --help, -h           Show this text
+
+Case ids:
+  ${GATEWAY_CASES.map((benchCase) => `${benchCase.id} (${benchCase.name})`).join("\n  ")}
+`);
 }
 
 function median(values: number[]): number {
   const sorted = [...values].toSorted((a, b) => a - b);
   const middle = Math.floor(sorted.length / 2);
   if (sorted.length % 2 === 0) {
-    return (sorted[middle - 1] + sorted[middle]) / 2;
+    return (
+      (expectDefined(sorted[middle - 1], "lower middle gateway startup sample") +
+        expectDefined(sorted[middle], "upper middle gateway startup sample")) /
+      2
+    );
   }
   return sorted[middle] ?? 0;
 }
@@ -258,6 +482,11 @@ function summarizeCase(benchCase: GatewayBenchCase, samples: GatewaySample[]): C
     name: benchCase.name,
     samples,
     summary: {
+      completionMs: summarizeNumbers(
+        samples
+          .map((sample) => sample.completionMs)
+          .filter((value): value is number => typeof value === "number"),
+      ),
       firstOutputMs: summarizeNumbers(
         samples
           .map((sample) => sample.firstOutputMs)
@@ -273,19 +502,24 @@ function summarizeCase(benchCase: GatewayBenchCase, samples: GatewaySample[]): C
           .map((sample) => sample.cpuMs)
           .filter((value): value is number => typeof value === "number"),
       ),
+      gatewayReadyLogMs: summarizeNumbers(
+        samples
+          .map((sample) => sample.gatewayReadyLogMs)
+          .filter((value): value is number => typeof value === "number"),
+      ),
       healthzMs: summarizeNumbers(
         samples
           .map((sample) => sample.healthz.ms)
           .filter((value): value is number => typeof value === "number"),
       ),
+      httpListenLogMs: summarizeNumbers(
+        samples
+          .map((sample) => sample.httpListenLogMs)
+          .filter((value): value is number => typeof value === "number"),
+      ),
       maxRssMb: summarizeNumbers(
         samples
           .map((sample) => sample.maxRssMb)
-          .filter((value): value is number => typeof value === "number"),
-      ),
-      readyLogMs: summarizeNumbers(
-        samples
-          .map((sample) => sample.readyLogMs)
           .filter((value): value is number => typeof value === "number"),
       ),
       readyzMs: summarizeNumbers(
@@ -296,6 +530,72 @@ function summarizeCase(benchCase: GatewayBenchCase, samples: GatewaySample[]): C
       startupTrace,
     },
   };
+}
+
+function collectResultFailures(
+  results: CaseResult[],
+  options: { processMetricsRequired?: boolean } = {},
+): BenchmarkFailure[] {
+  const processMetricsRequired = options.processMetricsRequired ?? process.platform !== "win32";
+  const failures: BenchmarkFailure[] = [];
+  for (const result of results) {
+    result.samples.forEach((sample, index) => {
+      const missing: string[] = [];
+      if (sample.healthz.status !== 200 || sample.healthz.ms == null) {
+        missing.push("/healthz");
+      }
+      if (sample.readyz.status !== 200 || sample.readyz.ms == null) {
+        missing.push("/readyz");
+      }
+      if (sample.completionMs == null) {
+        missing.push("completion");
+      }
+      if (processMetricsRequired) {
+        if (sample.cpuMs == null || sample.cpuCoreRatio == null) {
+          missing.push("cpu");
+        }
+        if (sample.maxRssMb == null) {
+          missing.push("rss");
+        }
+      }
+      if (missing.length > 0) {
+        failures.push({
+          id: result.id,
+          reason: `missing ${missing.join(", ")}`,
+          sampleIndex: index + 1,
+        });
+        return;
+      }
+      if (sample.exitedBeforeTeardown === true) {
+        failures.push({
+          id: result.id,
+          reason:
+            sample.signal == null
+              ? `child exited ${sample.exitCode ?? "before teardown"}`
+              : `child exited by ${sample.signal}`,
+          sampleIndex: index + 1,
+        });
+      }
+    });
+  }
+  return failures;
+}
+
+function printBenchmarkFailures(failures: BenchmarkFailure[]): void {
+  if (failures.length === 0) {
+    return;
+  }
+  console.error(
+    `[gateway-startup-bench] failed: ${failures.length} sample(s) did not produce ready probes or process metrics`,
+  );
+  for (const failure of failures.slice(0, 8)) {
+    console.error(
+      `[gateway-startup-bench] ${failure.id} run ${failure.sampleIndex}: ${failure.reason}`,
+    );
+  }
+  if (failures.length > 8) {
+    console.error(`[gateway-startup-bench] ${failures.length - 8} more sample failure(s) omitted`);
+  }
 }
 
 function formatMs(value: number | null): string {
@@ -319,14 +619,14 @@ function formatRatio(value: number | null): string {
   return value.toFixed(3);
 }
 
-function formatStats(stats: SummaryStats | null): string {
+function formatStats(stats: SummaryStats | null | undefined): string {
   if (!stats) {
     return "n/a";
   }
   return `p50=${formatMs(stats.p50)} avg=${formatMs(stats.avg)} min=${formatMs(stats.min)} max=${formatMs(stats.max)}`;
 }
 
-function formatMemoryStats(stats: SummaryStats | null): string {
+function formatMemoryStats(stats: SummaryStats | null | undefined): string {
   if (!stats) {
     return "n/a";
   }
@@ -340,22 +640,6 @@ function formatRatioStats(stats: SummaryStats | null): string {
   return `p50=${formatRatio(stats.p50)} avg=${formatRatio(stats.avg)} min=${formatRatio(stats.min)} max=${formatRatio(stats.max)}`;
 }
 
-async function getFreePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("failed to allocate port")));
-        return;
-      }
-      const { port } = address;
-      server.close(() => resolve(port));
-    });
-  });
-}
-
 async function waitForProbe(params: {
   deadlineAt: number;
   isDone?: () => boolean;
@@ -363,52 +647,123 @@ async function waitForProbe(params: {
   port: number;
   startAt: number;
 }): Promise<ProbeResult> {
+  let firstErrorKind: string | null = null;
+  let firstRecoveryMs: number | null = null;
   let lastStatus: number | null = null;
+  let lastStateKey: string | null = null;
+  let sawUnreadyState = false;
+  const transitions: ProbeTransition[] = [];
   while (performance.now() < params.deadlineAt) {
     if (params.isDone?.()) {
       break;
     }
-    const status = await requestStatus(params.port, params.path).catch(() => null);
-    lastStatus = status;
-    if (status === 200) {
-      return { ms: performance.now() - params.startAt, status };
+    const attempt = await requestProbeStatus(params.port, params.path);
+    const now = performance.now();
+    const elapsedMs = now - params.startAt;
+    lastStatus = attempt.status;
+    const stateKey = `${attempt.status ?? "none"}:${attempt.errorKind ?? "ok"}`;
+    if (stateKey !== lastStateKey) {
+      transitions.push({
+        ms: elapsedMs,
+        status: attempt.status,
+        ...(attempt.errorKind ? { errorKind: attempt.errorKind } : {}),
+      });
+      lastStateKey = stateKey;
+    }
+    if (attempt.errorKind && firstErrorKind == null) {
+      firstErrorKind = attempt.errorKind;
+    }
+    if (attempt.status !== 200) {
+      sawUnreadyState = true;
+    }
+    if (attempt.status === 200) {
+      if (sawUnreadyState && firstRecoveryMs == null) {
+        firstRecoveryMs = elapsedMs;
+      }
+      return {
+        firstErrorKind,
+        firstRecoveryMs,
+        ms: elapsedMs,
+        status: attempt.status,
+        transitions,
+      };
     }
     await delay(25);
   }
-  return { ms: null, status: lastStatus };
+  return { firstErrorKind, firstRecoveryMs, ms: null, status: lastStatus, transitions };
 }
 
-function requestStatus(port: number, pathname: string): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const req = request(
-      { host: "127.0.0.1", method: "GET", path: pathname, port, timeout: 100 },
-      (res) => {
-        res.resume();
-        res.on("end", () => resolve(res.statusCode ?? 0));
-      },
-    );
-    req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy(new Error("probe timeout"));
-    });
-    req.end();
-  });
+async function waitForStartupTracePhase(params: {
+  deadlineAt: number;
+  isDone: () => boolean;
+  phase: string;
+  startupTrace: Record<string, number>;
+}): Promise<number | null> {
+  const totalKey = `${params.phase}.total`;
+  while (performance.now() < params.deadlineAt) {
+    if (Object.hasOwn(params.startupTrace, totalKey)) {
+      return params.startupTrace[totalKey] ?? null;
+    }
+    if (params.isDone()) {
+      return null;
+    }
+    await delay(25);
+  }
+  return null;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function writePluginFixtures(root: string, count: number, activationOnStartup?: boolean): string[] {
-  const files: string[] = [];
+function writePluginFixtures(
+  root: string,
+  count: number,
+  activationOnStartup?: boolean,
+  providerCatalogStallMs?: number,
+  providerStaticCatalogStallMs?: number,
+  providerStaticCatalogModelCount?: number,
+): PluginFixtureResult {
+  const pluginIds: string[] = [];
   const pluginsDir = path.join(root, "plugins");
   mkdirSync(pluginsDir, { recursive: true });
   for (let index = 0; index < count; index += 1) {
     const id = `bench-plugin-${String(index + 1).padStart(2, "0")}`;
+    const stallsProviderCatalog = providerCatalogStallMs !== undefined && index === 0;
+    const stallsProviderStaticCatalog = providerStaticCatalogStallMs !== undefined && index === 0;
+    pluginIds.push(id);
     const pluginDir = path.join(pluginsDir, id);
     mkdirSync(pluginDir, { recursive: true });
     const entry = path.join(pluginDir, "index.cjs");
-    writeFileSync(entry, `module.exports = { id: ${JSON.stringify(id)}, register() {} };\n`);
+    const providerDiscoveryEntry = path.join(pluginDir, "provider-discovery.cjs");
+    const models = Array.from(
+      { length: stallsProviderStaticCatalog ? (providerStaticCatalogModelCount ?? 1) : 1 },
+      (_, modelIndex) => ({
+        id:
+          modelIndex === 0
+            ? STALLED_CATALOG_MODEL_ID
+            : `${STALLED_CATALOG_MODEL_ID}-${modelIndex + 1}`,
+        name: `Benchmark Model ${modelIndex + 1}`,
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 8_192,
+      }),
+    );
+    const provider = {
+      baseUrl: "http://127.0.0.1:1/v1",
+      api: "openai-completions",
+      models,
+    };
+    const entrySource = stallsProviderCatalog
+      ? `const provider = ${JSON.stringify(provider)};\nmodule.exports = { id: ${JSON.stringify(id)}, register(api) { api.registerProvider({ id: ${JSON.stringify(STALLED_CATALOG_PROVIDER_ID)}, label: "Benchmark Catalog Stall", auth: [], catalog: { order: "simple", run: async () => { const stopAt = Date.now() + ${providerCatalogStallMs}; while (Date.now() < stopAt) {} return { provider }; } }, staticCatalog: { order: "simple", run: async () => ({ provider }) } }); } };\n`
+      : stallsProviderStaticCatalog
+        ? `const provider = ${JSON.stringify(provider)};\nmodule.exports = { id: ${JSON.stringify(id)}, register(api) { api.registerProvider({ id: ${JSON.stringify(STALLED_CATALOG_PROVIDER_ID)}, label: "Benchmark Static Catalog Stall", auth: [], staticCatalog: { order: "simple", run: async () => ({ provider }) } }); } };\n`
+        : `module.exports = { id: ${JSON.stringify(id)}, register() {} };\n`;
+    writeFileSync(entry, entrySource);
+    if (stallsProviderStaticCatalog) {
+      writeFileSync(
+        providerDiscoveryEntry,
+        `const provider = ${JSON.stringify(provider)};\nlet staticCatalogCallCount = 0;\nmodule.exports = { id: ${JSON.stringify(STALLED_CATALOG_PROVIDER_ID)}, label: "Benchmark Static Catalog Stall", auth: [], staticCatalog: { order: "simple", run: async () => { staticCatalogCallCount += 1; console.log("startup trace: benchmark preparedRuntimeStaticCatalogCallCount=" + staticCatalogCallCount); const stopAt = Date.now() + ${providerStaticCatalogStallMs}; while (Date.now() < stopAt) {} return { provider }; } } };\n`,
+      );
+    }
     writeFileSync(
       path.join(pluginDir, "openclaw.plugin.json"),
       `${JSON.stringify(
@@ -417,29 +772,84 @@ function writePluginFixtures(root: string, count: number, activationOnStartup?: 
           ...(activationOnStartup === undefined
             ? {}
             : { activation: { onStartup: activationOnStartup } }),
+          ...(stallsProviderCatalog || stallsProviderStaticCatalog
+            ? {
+                providers: [STALLED_CATALOG_PROVIDER_ID],
+                ...(stallsProviderStaticCatalog
+                  ? { providerCatalogEntry: "./provider-discovery.cjs" }
+                  : {}),
+                ...(stallsProviderCatalog
+                  ? {
+                      modelCatalog: {
+                        providers: { [STALLED_CATALOG_PROVIDER_ID]: provider },
+                      },
+                    }
+                  : {}),
+              }
+            : {}),
           configSchema: { type: "object", additionalProperties: false },
         },
         null,
         2,
       )}\n`,
     );
-    files.push(entry);
   }
-  return files;
+  return { pluginIds, pluginsDir };
+}
+
+function buildBenchAgentList(
+  root: string,
+  topology: GatewayBenchCase["agentTopology"],
+): Array<{ id: string; default?: boolean; workspace: string }> | undefined {
+  if (!topology) {
+    return undefined;
+  }
+  const sharedWorkspace = path.join(root, "shared-workspace");
+  const distinctWorkspace = path.join(root, "distinct-workspace");
+  mkdirSync(sharedWorkspace, { recursive: true });
+  if (topology === "single") {
+    return [{ id: "main", default: true, workspace: sharedWorkspace }];
+  }
+  mkdirSync(distinctWorkspace, { recursive: true });
+  return Array.from({ length: 12 }, (_, index) => ({
+    id: `agent-${String(index + 1).padStart(2, "0")}`,
+    ...(index === 0 ? { default: true } : {}),
+    workspace: index === 11 ? distinctWorkspace : sharedWorkspace,
+  }));
 }
 
 function writeConfig(root: string, benchCase: GatewayBenchCase): string {
-  const pluginPaths = benchCase.pluginCount
-    ? writePluginFixtures(root, benchCase.pluginCount, benchCase.pluginActivationOnStartup)
-    : [];
+  const hasCatalogFixture =
+    benchCase.providerCatalogStallMs !== undefined ||
+    benchCase.providerStaticCatalogStallMs !== undefined;
+  const pluginCount = hasCatalogFixture ? 1 : benchCase.pluginCount;
+  const pluginFixtures = pluginCount
+    ? writePluginFixtures(
+        root,
+        pluginCount,
+        hasCatalogFixture ? true : benchCase.pluginActivationOnStartup,
+        benchCase.providerCatalogStallMs,
+        benchCase.providerStaticCatalogStallMs,
+        benchCase.providerStaticCatalogModelCount,
+      )
+    : null;
+  const agentList = buildBenchAgentList(root, benchCase.agentTopology);
   const config = {
     ...benchCase.config,
+    ...(agentList
+      ? {
+          agents: {
+            ...(benchCase.config.agents as Record<string, unknown> | undefined),
+            list: agentList,
+          },
+        }
+      : {}),
     plugins: {
       ...(benchCase.config.plugins as Record<string, unknown> | undefined),
-      ...(pluginPaths.length > 0
+      ...(pluginFixtures
         ? {
-            load: { paths: pluginPaths },
-            allow: pluginPaths.map((file) => path.basename(path.dirname(file))),
+            load: { paths: [pluginFixtures.pluginsDir] },
+            allow: pluginFixtures.pluginIds,
           }
         : {}),
     },
@@ -465,11 +875,9 @@ function sanitizedEnv(
     TMPDIR: process.env.TMPDIR,
     USER: process.env.USER ?? "openclaw-bench",
     npm_config_update_notifier: "false",
-    OPENCLAW_CONFIG: configPath,
     OPENCLAW_CONFIG_PATH: configPath,
     OPENCLAW_GATEWAY_STARTUP_TRACE: "1",
     OPENCLAW_HOME: root,
-    OPENCLAW_LOCAL_CHECK: "0",
     OPENCLAW_NO_RESPAWN: "1",
     OPENCLAW_STATE_DIR: path.join(root, "state"),
     OPENCLAW_TEST_DISABLE_UPDATE_CHECK: "1",
@@ -478,45 +886,16 @@ function sanitizedEnv(
   return env;
 }
 
-async function stopChild(child: ChildProcessWithoutNullStreams): Promise<{
-  exitCode: number | null;
-  signal: string | null;
-}> {
-  if (child.exitCode != null || child.signalCode != null) {
-    return { exitCode: child.exitCode, signal: child.signalCode };
-  }
-  const exited = new Promise<{ exitCode: number | null; signal: string | null }>((resolve) => {
-    child.once("exit", (exitCode, signal) => resolve({ exitCode, signal }));
-  });
-  killProcessTree(child, "SIGTERM");
-  const timeout = delay(2000).then(() => {
-    if (child.exitCode == null && child.signalCode == null) {
-      killProcessTree(child, "SIGKILL");
-    }
-    return exited;
-  });
-  return Promise.race([exited, timeout]);
-}
-
-function killProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
-  if (process.platform !== "win32" && child.pid !== undefined) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // Fall back to the direct child below.
-    }
-  }
-  child.kill(signal);
-}
-
 function collectStartupTrace(line: string, startupTrace: Record<string, number>): void {
   const phaseMatch = /startup trace: ([^ ]+) ([0-9.]+)ms total=([0-9.]+)ms(?: (.*))?/u.exec(line);
   if (phaseMatch) {
-    startupTrace[phaseMatch[1]] = Number(phaseMatch[2]);
-    startupTrace[`${phaseMatch[1]}.total`] = Number(phaseMatch[3]);
+    const phase = expectDefined(phaseMatch[1], "gateway startup trace phase name");
+    startupTrace[phase] = Number(expectDefined(phaseMatch[2], `${phase} startup duration`));
+    startupTrace[`${phase}.total`] = Number(
+      expectDefined(phaseMatch[3], `${phase} total startup duration`),
+    );
     for (const metric of parseStartupTraceMetrics(phaseMatch[4] ?? "")) {
-      startupTrace[`${phaseMatch[1]}.${metric.key}`] = metric.value;
+      startupTrace[`${phase}.${metric.key}`] = metric.value;
     }
     return;
   }
@@ -524,13 +903,21 @@ function collectStartupTrace(line: string, startupTrace: Record<string, number>)
   if (!detailMatch) {
     return;
   }
-  for (const metric of parseStartupTraceMetrics(detailMatch[2])) {
-    startupTrace[`${detailMatch[1]}.${metric.key}`] = metric.value;
+  const phase = expectDefined(detailMatch[1], "gateway startup detail phase name");
+  const detail = expectDefined(detailMatch[2], `${phase} startup detail metrics`);
+  for (const metric of parseStartupTraceMetrics(detail)) {
+    startupTrace[`${phase}.${metric.key}`] = metric.value;
   }
 }
 
-function hasGatewayReadyLog(line: string): boolean {
-  return /\[gateway\] (?:http server listening|ready \()/.test(line);
+function classifyGatewayReadyLog(line: string): "gateway-ready" | "http-listen" | null {
+  if (line.includes("[gateway] http server listening (")) {
+    return "http-listen";
+  }
+  if (/\[gateway\] ready(?:\s*\(|\s*$)/.test(line)) {
+    return "gateway-ready";
+  }
+  return null;
 }
 
 function parseStartupTraceMetrics(raw: string): Array<{ key: string; value: number }> {
@@ -540,9 +927,15 @@ function parseStartupTraceMetrics(raw: string): Array<{ key: string; value: numb
     if (!metricMatch) {
       continue;
     }
-    const key = metricMatch[1];
-    const value = Number(metricMatch[2]);
-    if (!Number.isFinite(value) || (key !== "eventLoopMax" && !key.endsWith("Ms"))) {
+    const key = expectDefined(metricMatch[1], "gateway startup trace metric key");
+    const value = Number(expectDefined(metricMatch[2], `${key} startup trace metric value`));
+    if (
+      !Number.isFinite(value) ||
+      (key !== "eventLoopMax" &&
+        !key.endsWith("Ms") &&
+        !key.endsWith("Mb") &&
+        !key.endsWith("Count"))
+    ) {
       continue;
     }
     metrics.push({ key, value });
@@ -550,89 +943,12 @@ function parseStartupTraceMetrics(raw: string): Array<{ key: string; value: numb
   return metrics;
 }
 
-function readProcessRssMb(pid: number | undefined): number | null {
-  if (!pid || process.platform === "win32") {
-    return null;
-  }
-  const result = spawnSync("ps", ["-o", "rss=", "-p", String(pid)], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status !== 0) {
-    return null;
-  }
-  const rssKb = Number.parseInt(result.stdout.trim(), 10);
-  return Number.isFinite(rssKb) && rssKb > 0 ? rssKb / 1024 : null;
-}
-
-function parsePsCpuTimeMs(raw: string): number | null {
-  const parts = raw.trim().split(":").map(Number);
-  if (parts.some((part) => !Number.isFinite(part) || part < 0)) {
-    return null;
-  }
-  if (parts.length === 2) {
-    return Math.round((parts[0] * 60 + parts[1]) * 1000);
-  }
-  if (parts.length === 3) {
-    return Math.round((parts[0] * 60 * 60 + parts[1] * 60 + parts[2]) * 1000);
-  }
-  return null;
-}
-
-function readProcessTreeCpuMs(rootPid: number | undefined): number | null {
-  if (!rootPid || process.platform === "win32") {
-    return null;
-  }
-  const result = spawnSync("ps", ["-eo", "pid=,ppid=,time="], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status !== 0) {
-    return null;
-  }
-
-  const childrenByParent = new Map<number, number[]>();
-  const cpuByPid = new Map<number, number>();
-  for (const line of result.stdout.split("\n")) {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)$/u);
-    if (!match) {
-      continue;
-    }
-    const pid = Number(match[1]);
-    const ppid = Number(match[2]);
-    const cpuMs = parsePsCpuTimeMs(match[3]);
-    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || cpuMs === null) {
-      continue;
-    }
-    cpuByPid.set(pid, cpuMs);
-    const children = childrenByParent.get(ppid) ?? [];
-    children.push(pid);
-    childrenByParent.set(ppid, children);
-  }
-  if (!cpuByPid.has(rootPid)) {
-    return null;
-  }
-
-  let totalCpuMs = 0;
-  const seen = new Set<number>();
-  const stack = [rootPid];
-  while (stack.length > 0) {
-    const pid = stack.pop();
-    if (!pid || seen.has(pid)) {
-      continue;
-    }
-    seen.add(pid);
-    totalCpuMs += cpuByPid.get(pid) ?? 0;
-    for (const childPid of childrenByParent.get(pid) ?? []) {
-      stack.push(childPid);
-    }
-  }
-  return totalCpuMs;
-}
-
 async function runGatewaySample(options: {
   benchCase: GatewayBenchCase;
+  cpuProfDir?: string;
   entry: string;
+  heapProfDir?: string;
+  sampleIndex: number;
   timeoutMs: number;
 }): Promise<GatewaySample> {
   const root = mkdtempSync(path.join(tmpdir(), "openclaw-gateway-bench-"));
@@ -644,28 +960,42 @@ async function runGatewaySample(options: {
   const startupTrace: Record<string, number> = {};
   const output: string[] = [];
   let firstOutputMs: number | null = null;
+  let gatewayReadyLogLine: string | null = null;
+  let gatewayReadyLogMs: number | null = null;
+  let httpListenLogLine: string | null = null;
+  let httpListenLogMs: number | null = null;
   let maxRssMb: number | null = null;
-  let readyLogMs: number | null = null;
   let childExited = false;
 
-  const child = spawn(
-    process.execPath,
-    [
-      options.entry,
-      "gateway",
-      "run",
-      "--port",
-      String(port),
-      "--bind",
-      "loopback",
-      "--auth",
-      "none",
-      "--tailscale",
-      "off",
-      "--allow-unconfigured",
-    ],
-    { cwd: process.cwd(), detached: process.platform !== "win32", env },
-  );
+  const childArgs = [
+    ...(options.cpuProfDir
+      ? [
+          "--cpu-prof",
+          "--cpu-prof-dir",
+          options.cpuProfDir,
+          "--cpu-prof-name",
+          `openclaw-gateway-${options.benchCase.id}-${options.sampleIndex}-${Date.now()}.cpuprofile`,
+        ]
+      : []),
+    ...(options.heapProfDir ? ["--heap-prof", "--heap-prof-dir", options.heapProfDir] : []),
+    options.entry,
+    "gateway",
+    "run",
+    "--port",
+    String(port),
+    "--bind",
+    "loopback",
+    "--auth",
+    "none",
+    "--tailscale",
+    "off",
+    "--allow-unconfigured",
+  ];
+  const child = spawn(process.execPath, childArgs, {
+    cwd: process.cwd(),
+    detached: process.platform !== "win32",
+    env,
+  });
   const cpuStartMs = readProcessTreeCpuMs(child.pid);
   const sampleRss = () => {
     const rssMb = readProcessRssMb(child.pid);
@@ -695,8 +1025,14 @@ async function runGatewaySample(options: {
       output.splice(0, output.length - 20);
     }
     for (const line of text.split(/\r?\n/u)) {
-      if (hasGatewayReadyLog(line) && readyLogMs == null) {
-        readyLogMs = performance.now() - startAt;
+      const readyLogKind = classifyGatewayReadyLog(line);
+      if (readyLogKind === "http-listen" && httpListenLogMs == null) {
+        httpListenLogMs = performance.now() - startAt;
+        httpListenLogLine = line;
+      }
+      if (readyLogKind === "gateway-ready" && gatewayReadyLogMs == null) {
+        gatewayReadyLogMs = performance.now() - startAt;
+        gatewayReadyLogLine = line;
       }
       collectStartupTrace(line, startupTrace);
     }
@@ -720,25 +1056,39 @@ async function runGatewaySample(options: {
       startAt,
     }),
   ]);
-  const readyAt = performance.now();
+  const completionMs = options.benchCase.completionTracePhase
+    ? await waitForStartupTracePhase({
+        deadlineAt,
+        isDone: () => childExited,
+        phase: options.benchCase.completionTracePhase,
+        startupTrace,
+      })
+    : performance.now() - startAt;
+  const completedAt = performance.now();
   const cpuEndMs = readProcessTreeCpuMs(child.pid);
   const cpuMs = cpuStartMs == null || cpuEndMs == null ? null : Math.max(0, cpuEndMs - cpuStartMs);
-  const cpuCoreRatio = cpuMs == null ? null : cpuMs / Math.max(1, readyAt - startAt);
+  const cpuCoreRatio = cpuMs == null ? null : cpuMs / Math.max(1, completedAt - startAt);
   const exit = await stopChild(child);
   clearInterval(rssTimer);
   sampleRss();
-  await childExitPromise.catch(() => null);
+  // stopChild is the bounded teardown wait; the raw exit promise may never settle.
+  void childExitPromise.catch(() => null);
   rmSync(root, { force: true, maxRetries: 3, recursive: true, retryDelay: 100 });
 
   return {
+    completionMs,
     cpuCoreRatio,
     cpuMs,
+    exitedBeforeTeardown: exit.exitedBeforeTeardown,
     exitCode: exit.exitCode,
     firstOutputMs,
+    gatewayReadyLogLine,
+    gatewayReadyLogMs,
     healthz,
+    httpListenLogLine,
+    httpListenLogMs,
     maxRssMb,
     outputTail: output.join("").split(/\r?\n/u).slice(-20).join("\n"),
-    readyLogMs,
     readyz,
     signal: exit.signal,
     startupTrace,
@@ -747,7 +1097,9 @@ async function runGatewaySample(options: {
 
 async function runCase(options: {
   benchCase: GatewayBenchCase;
+  cpuProfDir?: string;
   entry: string;
+  heapProfDir?: string;
   runs: number;
   timeoutMs: number;
   warmup: number;
@@ -757,17 +1109,32 @@ async function runCase(options: {
   for (let index = 0; index < total; index += 1) {
     const sample = await runGatewaySample({
       benchCase: options.benchCase,
+      cpuProfDir: options.cpuProfDir,
       entry: options.entry,
+      heapProfDir: options.heapProfDir,
+      sampleIndex: index + 1,
       timeoutMs: options.timeoutMs,
     });
     if (index >= options.warmup) {
       samples.push(sample);
+      const heapUsedMb = sample.startupTrace["memory.ready.heapUsedMb"] ?? null;
       console.log(
-        `[gateway-startup-bench] ${options.benchCase.id} run ${samples.length}/${options.runs}: healthz=${formatMs(sample.healthz.ms)} readyz=${formatMs(sample.readyz.ms)} readyLog=${formatMs(sample.readyLogMs)} cpu=${formatMs(sample.cpuMs)} cpuCore=${formatRatio(sample.cpuCoreRatio)} rss=${formatMb(sample.maxRssMb)}`,
+        `[gateway-startup-bench] ${options.benchCase.id} run ${samples.length}/${options.runs}: completion=${formatMs(sample.completionMs)} healthz=${formatMs(sample.healthz.ms)} readyz=${formatMs(sample.readyz.ms)} httpListen=${formatMs(sample.httpListenLogMs)} gatewayReady=${formatMs(sample.gatewayReadyLogMs)} cpu=${formatMs(sample.cpuMs)} cpuCore=${formatRatio(sample.cpuCoreRatio)} rss=${formatMb(sample.maxRssMb)} heap=${formatMb(heapUsedMb)}`,
       );
+      if (
+        sample.outputTail &&
+        (sample.completionMs == null ||
+          sample.healthz.status !== 200 ||
+          sample.readyz.status !== 200)
+      ) {
+        console.error(
+          `[gateway-startup-bench] ${options.benchCase.id} output tail:\n${sample.outputTail}`,
+        );
+      }
     } else {
+      const heapUsedMb = sample.startupTrace["memory.ready.heapUsedMb"] ?? null;
       console.log(
-        `[gateway-startup-bench] ${options.benchCase.id} warmup ${index + 1}/${options.warmup}: healthz=${formatMs(sample.healthz.ms)} readyz=${formatMs(sample.readyz.ms)} cpu=${formatMs(sample.cpuMs)} cpuCore=${formatRatio(sample.cpuCoreRatio)} rss=${formatMb(sample.maxRssMb)}`,
+        `[gateway-startup-bench] ${options.benchCase.id} warmup ${index + 1}/${options.warmup}: healthz=${formatMs(sample.healthz.ms)} readyz=${formatMs(sample.readyz.ms)} cpu=${formatMs(sample.cpuMs)} cpuCore=${formatRatio(sample.cpuCoreRatio)} rss=${formatMb(sample.maxRssMb)} heap=${formatMb(heapUsedMb)}`,
       );
     }
   }
@@ -776,17 +1143,25 @@ async function runCase(options: {
 
 function printResult(result: CaseResult): void {
   console.log(`\n${result.name} (${result.id})`);
+  console.log(`  completion:   ${formatStats(result.summary.completionMs)}`);
   console.log(`  first output: ${formatStats(result.summary.firstOutputMs)}`);
   console.log(`  CPU:          ${formatStats(result.summary.cpuMs)}`);
   console.log(`  CPU core:     ${formatRatioStats(result.summary.cpuCoreRatio)}`);
   console.log(`  /healthz:     ${formatStats(result.summary.healthzMs)}`);
-  console.log(`  ready log:    ${formatStats(result.summary.readyLogMs)}`);
+  console.log(`  http listen:  ${formatStats(result.summary.httpListenLogMs)}`);
+  console.log(`  gateway ready: ${formatStats(result.summary.gatewayReadyLogMs)}`);
   console.log(`  /readyz:      ${formatStats(result.summary.readyzMs)}`);
   console.log(`  max RSS:      ${formatMemoryStats(result.summary.maxRssMb)}`);
-  const trace = Object.entries(result.summary.startupTrace)
-    .filter(([name]) => !name.endsWith(".total"))
-    .toSorted((a, b) => (b[1].avg ?? 0) - (a[1].avg ?? 0))
-    .slice(0, 8);
+  console.log(
+    `  ready memory: rss=${formatMemoryStats(result.summary.startupTrace["memory.ready.rssMb"])} heap=${formatMemoryStats(result.summary.startupTrace["memory.ready.heapUsedMb"])} external=${formatMemoryStats(result.summary.startupTrace["memory.ready.externalMb"])}`,
+  );
+  console.log(
+    `  post-ready memory: rss=${formatMemoryStats(result.summary.startupTrace["memory.post-ready.rssMb"])} heap=${formatMemoryStats(result.summary.startupTrace["memory.post-ready.heapUsedMb"])} external=${formatMemoryStats(result.summary.startupTrace["memory.post-ready.externalMb"])}`,
+  );
+  console.log(
+    `  prepared runtime: agents=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.agentCount"])} workspaces=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.workspaceGroupCount"])} configuredGroups=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.configuredFactsGroupCount"])} configuredModels=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.configuredRuntimeModelCount"])} generatedPlugins=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.generatedCatalogPluginCount"])} generatedReads=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.generatedCatalogReadCount"])} sources=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.catalogSourceCount"])} credentials=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.credentialGroupCount"])} catalogs=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.catalogGroupCount"])} registries=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.runtimeRegistryCount"])} workspaceFacts=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.workspaceFactsMs"])} runtimePlugins=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.runtimePluginMs"])} metadata=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.pluginMetadataMs"])} staticProviders=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.staticProviderCatalogMs"])} ambientAuth=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.ambientCredentialsMs"])} agentFacts=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.agentFactsMs"])} configuredProjection=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.configuredProjectionMs"])} sourceMs=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.catalogSourceMs"])} registryMs=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.registryMs"])} sourceLimit=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.sourceConcurrencyLimitCount"])} fullCatalogLimit=${formatStats(result.summary.startupTrace["sidecars.model-runtime-build.fullCatalogConcurrencyLimitCount"])} staticCatalog=${formatStats(result.summary.startupTrace["benchmark.preparedRuntimeStaticCatalogCallCount"])} pluginLoader=${formatStats(result.summary.startupTrace["sidecars.plugin-loader.callsCount"])} eventLoopMax=${formatStats(result.summary.startupTrace["sidecars.model-runtime.eventLoopMax"])}`,
+  );
+  const trace = selectSlowStartupTraceDurations(result.summary.startupTrace, 8);
   if (trace.length > 0) {
     console.log("  trace top:");
     for (const [name, stats] of trace) {
@@ -796,13 +1171,27 @@ function printResult(result: CaseResult): void {
 }
 
 async function main() {
-  const options = parseOptions();
+  const argv = process.argv.slice(2);
+  if (hasHelpFlag(argv)) {
+    printUsage();
+    return;
+  }
+
+  const options = parseOptions(argv);
+  if (options.cpuProfDir) {
+    mkdirSync(options.cpuProfDir, { recursive: true });
+  }
+  if (options.heapProfDir) {
+    mkdirSync(options.heapProfDir, { recursive: true });
+  }
   const results: CaseResult[] = [];
   for (const benchCase of options.cases) {
     results.push(
       await runCase({
         benchCase,
+        cpuProfDir: options.cpuProfDir,
         entry: options.entry,
+        heapProfDir: options.heapProfDir,
         runs: options.runs,
         timeoutMs: options.timeoutMs,
         warmup: options.warmup,
@@ -821,14 +1210,45 @@ async function main() {
   }
   if (options.json) {
     console.log(JSON.stringify(payload, null, 2));
-    return;
+  } else {
+    for (const result of results) {
+      printResult(result);
+    }
   }
-  for (const result of results) {
-    printResult(result);
+
+  const failures = collectResultFailures(results);
+  if (failures.length > 0) {
+    printBenchmarkFailures(failures);
+    process.exitCode = 1;
   }
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.stack : String(err));
-  process.exitCode = 1;
-});
+export const testing = {
+  classifyGatewayReadyLog,
+  collectResultFailures,
+  collectStartupTrace,
+  parseOptions,
+  parseNonNegativeInt,
+  parsePositiveInt,
+  parseProcessRssKb,
+  resolveEntry,
+  sanitizedEnv,
+  stopChild,
+  summarizeCase,
+  validateCliArgs,
+  waitForProbe,
+  waitForStartupTracePhase,
+  writeConfig,
+};
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  main().catch((err: unknown) => {
+    if (err instanceof CliArgumentError) {
+      console.error(err.message);
+      process.exitCode = 1;
+      return;
+    }
+    console.error(err instanceof Error ? err.stack : String(err));
+    process.exitCode = 1;
+  });
+}

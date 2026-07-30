@@ -1,5 +1,5 @@
 ---
-summary: "Adds agent-callable tools."
+summary: "OpenClaw voice-call plugin for Twilio, Telnyx, and Plivo phone calls."
 read_when:
   - You are installing, configuring, or auditing the voice-call plugin
 title: "Voice Call plugin"
@@ -7,16 +7,16 @@ title: "Voice Call plugin"
 
 # Voice Call plugin
 
-Adds agent-callable tools.
+OpenClaw voice-call plugin for Twilio, Telnyx, and Plivo phone calls.
 
 ## Distribution
 
 - Package: `@openclaw/voice-call`
-- Install route: ClawHub + npm
+- Install route: npm; ClawHub
 
 ## Surface
 
-contracts: tools
+contracts: `tools`; skills
 
 ## Related docs
 

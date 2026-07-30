@@ -1,13 +1,26 @@
+/**
+ * sessions_send agent-to-agent reply flow.
+ *
+ * Runs bounded ping-pong delivery, waits for target replies, and suppresses control-token messages.
+ */
 import crypto from "node:crypto";
 import type { CallGatewayOptions } from "../../gateway/call.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { GatewayMessageChannel } from "../../utils/message-channel.js";
 import { resolveNestedAgentLaneForSession } from "../lanes.js";
-import { readLatestAssistantReply, waitForAgentRun } from "../run-wait.js";
+import {
+  type AgentWaitResult,
+  type AssistantReplySnapshot,
+  hasUpdatedAssistantReplySnapshot,
+  isRecoverableAgentWaitError,
+  readLatestAssistantReplySnapshot,
+  waitForAgentRun,
+} from "../run-wait.js";
 import { runAgentStep } from "./agent-step.js";
 import { resolveAnnounceTarget } from "./sessions-announce-target.js";
 import {
+  type AnnounceTarget,
   buildAgentToAgentAnnounceContext,
   buildAgentToAgentReplyContext,
   isAnnounceSkip,
@@ -30,6 +43,45 @@ let sessionsSendA2ADeps: {
   callGateway: GatewayCaller;
 } = defaultSessionsSendA2ADeps;
 
+function isDeliveryFailureWait(wait: AgentWaitResult): boolean {
+  return (
+    (wait.status === "error" && !isRecoverableAgentWaitError(wait.error)) ||
+    (wait.status === "timeout" && wait.pendingError === true)
+  );
+}
+
+async function deliverAnnounceReply(params: {
+  announceTarget: AnnounceTarget;
+  message: string;
+  runContextId: string;
+}) {
+  const message = params.message.trim();
+  if (!message) {
+    return;
+  }
+  try {
+    await sessionsSendA2ADeps.callGateway({
+      method: "send",
+      params: {
+        to: params.announceTarget.to,
+        message,
+        channel: params.announceTarget.channel,
+        accountId: params.announceTarget.accountId,
+        threadId: params.announceTarget.threadId,
+        idempotencyKey: crypto.randomUUID(),
+      },
+      timeoutMs: 10_000,
+    });
+  } catch (err) {
+    log.warn("sessions_send announce delivery failed", {
+      runId: params.runContextId,
+      channel: params.announceTarget.channel,
+      to: params.announceTarget.to,
+      error: formatErrorMessage(err),
+    });
+  }
+}
+
 export async function runSessionsSendA2AFlow(params: {
   targetSessionKey: string;
   displayKey: string;
@@ -38,8 +90,10 @@ export async function runSessionsSendA2AFlow(params: {
   maxPingPongTurns: number;
   requesterSessionKey?: string;
   requesterChannel?: GatewayMessageChannel;
+  baseline?: AssistantReplySnapshot;
   roundOneReply?: string;
   waitRunId?: string;
+  notifyRequesterOnWaitFailure?: boolean;
 }) {
   const runContextId = params.waitRunId ?? "unknown";
   try {
@@ -52,10 +106,37 @@ export async function runSessionsSendA2AFlow(params: {
         callGateway: sessionsSendA2ADeps.callGateway,
       });
       if (wait.status === "ok") {
-        primaryReply = await readLatestAssistantReply({
+        const latestSnapshot = await readLatestAssistantReplySnapshot({
           sessionKey: params.targetSessionKey,
+          stopAtTranscriptArtifact: true,
+          callGateway: sessionsSendA2ADeps.callGateway,
         });
+        primaryReply = hasUpdatedAssistantReplySnapshot(latestSnapshot, params.baseline)
+          ? latestSnapshot.text
+          : undefined;
         latestReply = primaryReply;
+      } else {
+        if (
+          params.notifyRequesterOnWaitFailure === true &&
+          params.requesterSessionKey &&
+          isDeliveryFailureWait(wait)
+        ) {
+          const error =
+            typeof wait.error === "string" && wait.error.trim() ? `: ${wait.error.trim()}` : "";
+          await runAgentStep({
+            sessionKey: params.requesterSessionKey,
+            message:
+              `sessions_send delivery to ${params.displayKey} failed${error}. ` +
+              "The target may not have received the message; retry or report the failure instead of assuming delivery succeeded.",
+            extraSystemPrompt:
+              "A previous sessions_send delivery failed after it was accepted. Decide whether to retry, use another route, or report the failure. Do not assume the target received the message.",
+            timeoutMs: params.announceTimeoutMs,
+            lane: resolveNestedAgentLaneForSession(params.requesterSessionKey),
+            sourceSessionKey: params.targetSessionKey,
+            sourceTool: "sessions_send",
+          });
+        }
+        return;
       }
     }
     if (!latestReply) {
@@ -70,6 +151,29 @@ export async function runSessionsSendA2AFlow(params: {
       displayKey: params.displayKey,
     });
     const targetChannel = announceTarget?.channel ?? "unknown";
+
+    // A same-session send is a human-facing source-channel reply, not a true
+    // agent-to-agent announcement. Asking the same session to decide whether to
+    // announce can re-run the same prompt and duplicate source-reply side effects.
+    const sameSessionSourceReply =
+      params.requesterSessionKey && params.requesterSessionKey === params.targetSessionKey;
+    const canDirectDeliverSameSessionReply =
+      announceTarget &&
+      (!params.requesterChannel || params.requesterChannel === announceTarget.channel);
+    if (sameSessionSourceReply && canDirectDeliverSameSessionReply) {
+      if (params.waitRunId && !params.roundOneReply && !params.baseline) {
+        return;
+      }
+      await deliverAnnounceReply({
+        announceTarget,
+        message: latestReply,
+        runContextId,
+      });
+      return;
+    }
+    if (sameSessionSourceReply && !announceTarget) {
+      return;
+    }
 
     if (
       params.maxPingPongTurns > 0 &&
@@ -140,27 +244,11 @@ export async function runSessionsSendA2AFlow(params: {
       !isAnnounceSkip(announceReply) &&
       !isNonDeliverableSessionsReply(announceReply)
     ) {
-      try {
-        await sessionsSendA2ADeps.callGateway({
-          method: "send",
-          params: {
-            to: announceTarget.to,
-            message: announceReply.trim(),
-            channel: announceTarget.channel,
-            accountId: announceTarget.accountId,
-            threadId: announceTarget.threadId,
-            idempotencyKey: crypto.randomUUID(),
-          },
-          timeoutMs: 10_000,
-        });
-      } catch (err) {
-        log.warn("sessions_send announce delivery failed", {
-          runId: runContextId,
-          channel: announceTarget.channel,
-          to: announceTarget.to,
-          error: formatErrorMessage(err),
-        });
-      }
+      await deliverAnnounceReply({
+        announceTarget,
+        message: announceReply,
+        runContextId,
+      });
     }
   } catch (err) {
     log.warn("sessions_send announce flow failed", {
@@ -170,7 +258,7 @@ export async function runSessionsSendA2AFlow(params: {
   }
 }
 
-export const __testing = {
+const testing = {
   setDepsForTest(overrides?: Partial<{ callGateway: GatewayCaller }>) {
     sessionsSendA2ADeps = overrides
       ? {
@@ -180,3 +268,9 @@ export const __testing = {
       : defaultSessionsSendA2ADeps;
   },
 };
+
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.sessionsSendA2ATestApi")] = {
+    testing,
+  };
+}

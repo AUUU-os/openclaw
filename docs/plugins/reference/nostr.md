@@ -1,5 +1,5 @@
 ---
-summary: "Adds the Nostr channel surface for sending and receiving OpenClaw messages."
+summary: "OpenClaw Nostr channel plugin for NIP-04 encrypted direct messages."
 read_when:
   - You are installing, configuring, or auditing the nostr plugin
 title: "Nostr plugin"
@@ -7,16 +7,16 @@ title: "Nostr plugin"
 
 # Nostr plugin
 
-Adds the Nostr channel surface for sending and receiving OpenClaw messages.
+OpenClaw Nostr channel plugin for NIP-04 encrypted direct messages.
 
 ## Distribution
 
 - Package: `@openclaw/nostr`
-- Install route: ClawHub + npm
+- Install route: npm; ClawHub
 
 ## Surface
 
-channels: nostr
+channels: `nostr`
 
 ## Related docs
 

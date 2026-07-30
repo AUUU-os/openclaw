@@ -1,3 +1,4 @@
+// Verifies legacy-rule validation uses the fast path for known config shapes.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LegacyConfigRule } from "./legacy.shared.js";
 
@@ -6,6 +7,15 @@ const { collectChannelLegacyConfigRulesMock, listPluginDoctorLegacyConfigRulesMo
     collectChannelLegacyConfigRulesMock: vi.fn((): LegacyConfigRule[] => []),
     listPluginDoctorLegacyConfigRulesMock: vi.fn((): LegacyConfigRule[] => []),
   }),
+);
+const loadPluginMetadataSnapshotMock = vi.hoisted(() =>
+  vi.fn(() => ({
+    manifestRegistry: {
+      diagnostics: [],
+      plugins: [],
+    },
+    plugins: [],
+  })),
 );
 
 vi.mock("../channels/plugins/legacy-config.js", () => ({
@@ -16,6 +26,10 @@ vi.mock("../plugins/doctor-contract-registry.js", () => ({
   listPluginDoctorLegacyConfigRules: listPluginDoctorLegacyConfigRulesMock,
 }));
 
+vi.mock("../plugins/plugin-metadata-snapshot.js", () => ({
+  loadPluginMetadataSnapshot: loadPluginMetadataSnapshotMock,
+}));
+
 import { validateConfigObjectRaw } from "./validation.js";
 
 describe("config validation legacy rule loading", () => {
@@ -24,6 +38,7 @@ describe("config validation legacy rule loading", () => {
     collectChannelLegacyConfigRulesMock.mockReturnValue([]);
     listPluginDoctorLegacyConfigRulesMock.mockReset();
     listPluginDoctorLegacyConfigRulesMock.mockReturnValue([]);
+    loadPluginMetadataSnapshotMock.mockClear();
   });
 
   it("does not load channel or plugin doctor legacy rules for valid raw config", () => {
@@ -43,6 +58,7 @@ describe("config validation legacy rule loading", () => {
     expect(result.ok).toBe(true);
     expect(collectChannelLegacyConfigRulesMock).not.toHaveBeenCalled();
     expect(listPluginDoctorLegacyConfigRulesMock).not.toHaveBeenCalled();
+    expect(loadPluginMetadataSnapshotMock).not.toHaveBeenCalled();
   });
 
   it("does not load plugin doctor legacy rules for invalid raw config", () => {

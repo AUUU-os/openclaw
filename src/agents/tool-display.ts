@@ -1,5 +1,10 @@
+/**
+ * User-facing tool display formatter.
+ *
+ * Builds redacted labels and compact details from tool metadata without affecting execution semantics.
+ */
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { redactToolDetail } from "../logging/redact.js";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 import { shortenHomeInString } from "../utils.js";
 import {
   defaultTitle,
@@ -9,6 +14,7 @@ import {
   resolveToolVerbAndDetailForArgs,
 } from "./tool-display-common.js";
 import { TOOL_DISPLAY_CONFIG } from "./tool-display-config.js";
+import type { ToolDetailMode } from "./tool-display-exec.js";
 
 type ToolDisplay = {
   name: string;
@@ -41,10 +47,12 @@ const DETAIL_LABEL_OVERRIDES: Record<string, string> = {
 };
 const MAX_DETAIL_ENTRIES = 8;
 
+/** Resolves the display model for a tool invocation. */
 export function resolveToolDisplay(params: {
   name?: string;
   args?: unknown;
   meta?: string;
+  detailMode?: ToolDetailMode;
 }): ToolDisplay {
   const name = normalizeToolName(params.name);
   const key = normalizeLowercaseStringOrEmpty(name);
@@ -52,16 +60,19 @@ export function resolveToolDisplay(params: {
   const emoji = spec?.emoji ?? FALLBACK.emoji ?? "🧩";
   const title = spec?.title ?? defaultTitle(name);
   const label = spec?.label ?? title;
-  let { verb, detail } = resolveToolVerbAndDetailForArgs({
+  const toolDisplayParts = resolveToolVerbAndDetailForArgs({
     toolKey: key,
     args: params.args,
     meta: params.meta,
     spec,
     fallbackDetailKeys: FALLBACK.detailKeys,
     detailMode: "summary",
+    toolDetailMode: params.detailMode,
     detailMaxEntries: MAX_DETAIL_ENTRIES,
     detailFormatKey: (raw) => formatDetailKey(raw, DETAIL_LABEL_OVERRIDES),
   });
+  const { verb } = toolDisplayParts;
+  let { detail } = toolDisplayParts;
 
   if (detail) {
     detail = shortenHomeInString(detail);
@@ -77,13 +88,29 @@ export function resolveToolDisplay(params: {
   };
 }
 
+/** Formats and redacts detail text for display. */
 export function formatToolDetail(display: ToolDisplay): string | undefined {
   const detailRaw = display.detail ? redactToolDetail(display.detail) : undefined;
   return formatToolDetailText(detailRaw);
 }
 
+/**
+ * Shell-family tools render their command as the whole line instead of
+ * "Label: detail". Backends spell the same tool differently — the Claude CLI
+ * sends "Bash" where embedded runs send "bash"/"exec" — so every caller must
+ * compare the normalized name or the shell line silently loses its detail.
+ */
+export function isShellToolDisplayName(name: string | undefined): boolean {
+  const normalized = normalizeLowercaseStringOrEmpty(name);
+  return normalized === "bash" || normalized === "exec" || normalized === "shell";
+}
+
+/** Builds the compact one-line summary shown in transcripts and logs. */
 export function formatToolSummary(display: ToolDisplay): string {
   const detail = formatToolDetail(display);
+  if (detail && isShellToolDisplayName(display.name)) {
+    return `${display.emoji} ${detail}`;
+  }
   return detail
     ? `${display.emoji} ${display.label}: ${detail}`
     : `${display.emoji} ${display.label}`;

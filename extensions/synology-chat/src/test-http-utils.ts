@@ -1,3 +1,4 @@
+// Synology Chat helper module supports test http utils behavior.
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -44,25 +45,37 @@ export function makeStalledReq(
   return makeBaseReq(method, opts);
 }
 
-export function makeRes(): ServerResponse & { _status: number; _body: string } {
+export function makeRes(): ServerResponse & {
+  status: number;
+  body: string;
+  headers: Record<string, string>;
+} {
   const res = {
-    _status: 0,
-    _body: "",
-    writeHead(statusCode: number, _headers: Record<string, string>) {
-      res._status = statusCode;
+    status: 0,
+    body: "",
+    headers: {} as Record<string, string>,
+    setHeader(name: string, value: string) {
+      res.headers[name.toLowerCase()] = value;
+    },
+    writeHead(statusCode: number, _headers?: Record<string, string>) {
+      res.status = statusCode;
     },
     end(body?: string) {
-      res._body = body ?? "";
+      res.body = body ?? "";
     },
-  } as unknown as ServerResponse & { _status: number; _body: string };
+  } as unknown as ServerResponse & {
+    status: number;
+    body: string;
+    headers: Record<string, string>;
+  };
   Object.defineProperty(res, "statusCode", {
     configurable: true,
     enumerable: true,
     get() {
-      return res._status;
+      return res.status;
     },
     set(value: number) {
-      res._status = value;
+      res.status = value;
     },
   });
   return res;

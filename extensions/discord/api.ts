@@ -1,3 +1,4 @@
+// Discord API module exposes the plugin public contract.
 export { discordPlugin } from "./src/channel.js";
 export { discordSetupPlugin } from "./src/channel.setup.js";
 export {
@@ -5,11 +6,8 @@ export {
   handleDiscordSubagentEnded,
   handleDiscordSubagentSpawning,
 } from "./src/subagent-hooks.js";
-export {
-  type DiscordCredentialStatus,
-  inspectDiscordAccount,
-  type InspectedDiscordAccount,
-} from "./src/account-inspect.js";
+export { inspectDiscordAccount, type InspectedDiscordAccount } from "./src/account-inspect.js";
+export { type DiscordCredentialStatus } from "./src/token.js";
 export {
   createDiscordActionGate,
   listDiscordAccountIds,
@@ -22,6 +20,7 @@ export {
   resolveDiscordMaxLinesPerMessage,
 } from "./src/accounts.js";
 export { tryHandleDiscordMessageActionGuildAdmin } from "./src/actions/handle-action.guild-admin.js";
+export { DiscordApiError, fetchDiscord, requestDiscord } from "./src/api.js";
 export { buildDiscordComponentMessage } from "./src/components.js";
 type DiscordMessageActionHandler =
   typeof import("./src/channel-actions.runtime.js").handleDiscordMessageAction;
@@ -125,8 +124,19 @@ export {
   DISCORD_ATTACHMENT_TOTAL_TIMEOUT_MS,
   DISCORD_DEFAULT_INBOUND_WORKER_TIMEOUT_MS,
   DISCORD_DEFAULT_LISTENER_TIMEOUT_MS,
-  mergeAbortSignals,
 } from "./src/monitor/timeouts.js";
+
+/**
+ * @deprecated Shipped `@openclaw/discord/api` compatibility only. Use native
+ * `AbortSignal.any` after filtering optional signals. Removal with the next
+ * plugin-SDK major.
+ */
+export function mergeAbortSignals(
+  signals: Array<AbortSignal | undefined>,
+): AbortSignal | undefined {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal));
+  return activeSignals.length > 1 ? AbortSignal.any(activeSignals) : activeSignals[0];
+}
 export type { DiscordSendComponents, DiscordSendEmbeds } from "./src/send.shared.js";
 export type { DiscordSendResult } from "./src/send.types.js";
 export type { DiscordTokenResolution } from "./src/token.js";

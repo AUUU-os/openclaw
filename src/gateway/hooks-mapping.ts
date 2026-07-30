@@ -1,9 +1,14 @@
+// Gateway hook mapping resolver.
+// Normalizes hook presets, templates, transforms, and resolved hook actions.
 import fs from "node:fs";
 import path from "node:path";
+import {
+  normalizeOptionalString,
+  readStringValue,
+} from "@openclaw/normalization-core/string-coerce";
 import { resolveConfigPathCandidate } from "../config/paths.js";
-import type { HookMappingConfig, HooksConfig } from "../config/types.hooks.js";
+import type { HookMappingConfig, HooksConfig, HookSessionMode } from "../config/types.hooks.js";
 import { importFileModule, resolveFunctionModuleExport } from "../hooks/module-loader.js";
-import { normalizeOptionalString, readStringValue } from "../shared/string-coerce.js";
 import type { HookMessageChannel } from "./hooks.types.js";
 
 export type HookMappingResolved = {
@@ -15,6 +20,7 @@ export type HookMappingResolved = {
   name?: string;
   agentId?: string;
   sessionKey?: string;
+  sessionMode?: HookSessionMode;
   messageTemplate?: string;
   textTemplate?: string;
   deliver?: boolean;
@@ -44,6 +50,9 @@ type HookAction =
       kind: "wake";
       text: string;
       mode: "now" | "next-heartbeat";
+      agentId?: string;
+      sessionKey?: string;
+      sessionKeySource?: "static" | "templated";
     }
   | {
       kind: "agent";
@@ -53,6 +62,7 @@ type HookAction =
       wakeMode: "now" | "next-heartbeat";
       sessionKey?: string;
       sessionKeySource?: "static" | "templated";
+      sessionMode: HookSessionMode;
       deliver?: boolean;
       allowUnsafeExternalContent?: boolean;
       channel?: HookMessageChannel;
@@ -85,6 +95,12 @@ const hookPresetMappings: Record<string, HookMappingConfig[]> = {
 };
 
 const transformCache = new Map<string, HookTransformFn>();
+let transformCacheBustVersion = 0;
+
+export function commitHookTransformMappingReload(): void {
+  transformCache.clear();
+  transformCacheBustVersion += 1;
+}
 
 type HookTransformResult = Partial<{
   kind: HookAction["kind"];
@@ -96,6 +112,7 @@ type HookTransformResult = Partial<{
   name: string;
   sessionKey: string;
   sessionKeySource: HookSessionKeyTemplateSource;
+  sessionMode: HookSessionMode;
   deliver: boolean;
   allowUnsafeExternalContent: boolean;
   channel: HookMessageChannel;
@@ -109,6 +126,7 @@ type HookTransformFn = (
   ctx: HookMappingContext,
 ) => HookTransformResult | Promise<HookTransformResult>;
 
+/** Resolve configured hook mappings plus preset mappings into normalized matcher entries. */
 export function resolveHookMappings(
   hooks?: HooksConfig,
   opts?: { configDir?: string },
@@ -214,6 +232,7 @@ function normalizeHookMapping(
     name: mapping.name,
     agentId: normalizeOptionalString(mapping.agentId),
     sessionKey: mapping.sessionKey,
+    sessionMode: mapping.sessionMode,
     messageTemplate: mapping.messageTemplate,
     textTemplate: mapping.textTemplate,
     deliver: mapping.deliver,
@@ -254,6 +273,9 @@ function buildActionFromMapping(
         kind: "wake",
         text,
         mode: mapping.wakeMode ?? "now",
+        agentId: mapping.agentId,
+        sessionKey: renderOptional(mapping.sessionKey, ctx),
+        sessionKeySource: getSessionKeyTemplateSource(mapping.sessionKey),
       },
     };
   }
@@ -268,6 +290,7 @@ function buildActionFromMapping(
       wakeMode: mapping.wakeMode ?? "now",
       sessionKey: renderOptional(mapping.sessionKey, ctx),
       sessionKeySource: getSessionKeyTemplateSource(mapping.sessionKey),
+      sessionMode: mapping.sessionMode ?? "isolated",
       deliver: mapping.deliver,
       allowUnsafeExternalContent: mapping.allowUnsafeExternalContent,
       channel: mapping.channel,
@@ -292,7 +315,14 @@ function mergeAction(
     const baseWake = base.kind === "wake" ? base : undefined;
     const text = typeof override.text === "string" ? override.text : (baseWake?.text ?? "");
     const mode = override.mode === "next-heartbeat" ? "next-heartbeat" : (baseWake?.mode ?? "now");
-    return validateAction({ kind: "wake", text, mode });
+    return validateAction({
+      kind: "wake",
+      text,
+      mode,
+      agentId: override.agentId ?? baseWake?.agentId,
+      sessionKey: override.sessionKey ?? baseWake?.sessionKey,
+      sessionKeySource: resolveMergedSessionKeySource(baseWake, override),
+    });
   }
   const baseAgent = base.kind === "agent" ? base : undefined;
   const message =
@@ -307,6 +337,7 @@ function mergeAction(
     agentId: override.agentId ?? baseAgent?.agentId,
     sessionKey: override.sessionKey ?? baseAgent?.sessionKey,
     sessionKeySource: resolveMergedSessionKeySource(baseAgent, override),
+    sessionMode: override.sessionMode ?? baseAgent?.sessionMode ?? "isolated",
     deliver: typeof override.deliver === "boolean" ? override.deliver : baseAgent?.deliver,
     allowUnsafeExternalContent:
       typeof override.allowUnsafeExternalContent === "boolean"
@@ -321,14 +352,26 @@ function mergeAction(
 }
 
 function validateAction(action: HookAction): HookMappingResult {
+  if (action.sessionKeySource === "templated" && !action.sessionKey?.trim()) {
+    return { ok: false, error: "hook mapping sessionKey template rendered empty" };
+  }
   if (action.kind === "wake") {
     if (!action.text?.trim()) {
       return { ok: false, error: "hook mapping requires text" };
+    }
+    if (action.mode === "next-heartbeat" && action.sessionKey) {
+      return {
+        ok: false,
+        error: "hook mapping sessionKey requires wakeMode=now",
+      };
     }
     return { ok: true, action };
   }
   if (!action.message?.trim()) {
     return { ok: false, error: "hook mapping requires message" };
+  }
+  if (action.sessionMode !== "isolated" && action.sessionMode !== "persistent") {
+    return { ok: false, error: "hook mapping sessionMode must be isolated or persistent" };
   }
   return { ok: true, action };
 }
@@ -344,7 +387,7 @@ function getSessionKeyTemplateSource(
 }
 
 function resolveMergedSessionKeySource(
-  baseAgent: Extract<HookAction, { kind: "agent" }> | undefined,
+  baseAction: HookAction | undefined,
   override: Exclude<HookTransformResult, null>,
 ): HookSessionKeyTemplateSource | undefined {
   if (typeof override.sessionKey === "string") {
@@ -356,7 +399,7 @@ function resolveMergedSessionKeySource(
     }
     return override.sessionKeySource === "static" ? "static" : "templated";
   }
-  return baseAgent?.sessionKeySource;
+  return baseAction?.sessionKeySource;
 }
 
 export function hasHookTemplateExpressions(template: string): boolean {
@@ -369,9 +412,16 @@ async function loadTransform(transform: HookMappingTransformResolved): Promise<H
   if (cached) {
     return cached;
   }
-  const mod = await importFileModule({ modulePath: transform.modulePath });
+  const generation = transformCacheBustVersion;
+  const mod = await importFileModule({
+    modulePath: transform.modulePath,
+    cacheBust: true,
+    nowMs: generation,
+  });
   const fn = resolveTransformFn(mod, transform.exportName);
-  transformCache.set(cacheKey, fn);
+  if (generation === transformCacheBustVersion) {
+    transformCache.set(cacheKey, fn);
+  }
   return fn;
 }
 

@@ -1,3 +1,4 @@
+// Sync Plugin Versions script supports OpenClaw repository automation.
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -24,6 +25,11 @@ type SyncPluginVersionsOptions = {
 };
 
 const OPENCLAW_VERSION_RANGE_RE = /^>=\d{4}\.\d{1,2}\.\d{1,2}(?:[-.][^"\s]+)?$/u;
+const VERSION_ALIGNED_PACKAGE_DIRS = [
+  "packages/ai",
+  "packages/gateway-client",
+  "packages/gateway-protocol",
+] as const;
 
 function syncOpenClawDependencyRange(
   deps: Record<string, string> | undefined,
@@ -66,6 +72,10 @@ function syncBuildOpenClawVersion(pkg: PackageJson, targetVersion: string): bool
   }
   build.openclawVersion = targetVersion;
   return true;
+}
+
+function changelogVersionForPackageVersion(version: string): string {
+  return version.replace(/-beta\.\d+$/u, "");
 }
 
 function ensureChangelogEntry(changelogPath: string, version: string, write: boolean): boolean {
@@ -112,6 +122,22 @@ export function syncPluginVersions(
   const changelogged: string[] = [];
   const skipped: string[] = [];
 
+  for (const packageDir of VERSION_ALIGNED_PACKAGE_DIRS) {
+    const packagePath = join(rootDir, packageDir, "package.json");
+    if (!existsSync(packagePath)) {
+      continue;
+    }
+    const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as PackageJson;
+    if (!pkg.name || pkg.version === targetVersion) {
+      continue;
+    }
+    pkg.version = targetVersion;
+    if (write) {
+      writeFileSync(packagePath, `${JSON.stringify(pkg, null, 2)}\n`);
+    }
+    updated.push(pkg.name);
+  }
+
   for (const dir of dirs) {
     const packagePath = join(extensionsDir, dir.name, "package.json");
     let pkg: PackageJson;
@@ -127,7 +153,8 @@ export function syncPluginVersions(
     }
 
     const changelogPath = join(extensionsDir, dir.name, "CHANGELOG.md");
-    if (ensureChangelogEntry(changelogPath, targetVersion, write)) {
+    const changelogVersion = changelogVersionForPackageVersion(targetVersion);
+    if (ensureChangelogEntry(changelogPath, changelogVersion, write)) {
       changelogged.push(pkg.name);
     }
 

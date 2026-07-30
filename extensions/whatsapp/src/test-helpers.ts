@@ -1,3 +1,4 @@
+// Whatsapp helper module supports test helpers behavior.
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -9,7 +10,6 @@ import { createMockBaileys } from "../../../test/mocks/baileys.js";
 
 // Use globalThis to store the mock config so it survives vi.mock hoisting
 const CONFIG_KEY = Symbol.for("openclaw:testConfigMock");
-const SOURCE_CONFIG_KEY = Symbol.for("openclaw:testSourceConfigMock");
 const DEFAULT_CONFIG = {
   channels: {
     whatsapp: {
@@ -27,22 +27,12 @@ const DEFAULT_CONFIG = {
 if (!(globalThis as Record<symbol, unknown>)[CONFIG_KEY]) {
   (globalThis as Record<symbol, unknown>)[CONFIG_KEY] = () => DEFAULT_CONFIG;
 }
-if (!(globalThis as Record<symbol, unknown>)[SOURCE_CONFIG_KEY]) {
-  (globalThis as Record<symbol, unknown>)[SOURCE_CONFIG_KEY] = () => loadConfigMock();
-}
-
 export function setLoadConfigMock(fn: unknown) {
   (globalThis as Record<symbol, unknown>)[CONFIG_KEY] = typeof fn === "function" ? fn : () => fn;
 }
 
-export function setRuntimeConfigSourceSnapshotMock(fn: unknown) {
-  (globalThis as Record<symbol, unknown>)[SOURCE_CONFIG_KEY] =
-    typeof fn === "function" ? fn : () => fn;
-}
-
 export function resetLoadConfigMock() {
   (globalThis as Record<symbol, unknown>)[CONFIG_KEY] = () => DEFAULT_CONFIG;
-  (globalThis as Record<symbol, unknown>)[SOURCE_CONFIG_KEY] = () => loadConfigMock();
 }
 
 function resolveStorePathFallback(store?: string, opts?: { agentId?: string }) {
@@ -66,14 +56,6 @@ function loadConfigMock() {
     return getter();
   }
   return DEFAULT_CONFIG;
-}
-
-function loadRuntimeConfigSourceSnapshotMock() {
-  const getter = (globalThis as Record<symbol, unknown>)[SOURCE_CONFIG_KEY];
-  if (typeof getter === "function") {
-    return getter();
-  }
-  return loadConfigMock();
 }
 
 async function updateLastRouteMock(params: {
@@ -201,16 +183,29 @@ function resolveSenderLabelMock(sender?: TestInboundEnvelopeParams["sender"]) {
   return display || idPart || undefined;
 }
 
+function resolveDirectEnvelopeBodyLabelMock(from?: string) {
+  const label = sanitizeEnvelopeHeaderPart(from?.trim() || "");
+  const idMarkerIndex = label.search(/\s+id:/i);
+  if (idMarkerIndex > 0) {
+    const displayLabel = label.slice(0, idMarkerIndex).trim();
+    return displayLabel.includes(":") ? "(sender)" : displayLabel;
+  }
+  return label.includes(":") ? "(sender)" : label;
+}
+
 function formatInboundEnvelopeMock(params: TestInboundEnvelopeParams) {
   const chatType = normalizeLowercaseStringOrEmpty(params.chatType);
   const isDirect = !chatType || chatType === "direct";
   const sender = params.senderLabel?.trim() || resolveSenderLabelMock(params.sender);
+  const directSender = resolveDirectEnvelopeBodyLabelMock(params.from);
   const body =
     isDirect && params.fromMe
       ? `(self): ${params.body}`
-      : !isDirect && sender
-        ? `${sanitizeEnvelopeHeaderPart(sender)}: ${params.body}`
-        : params.body;
+      : isDirect && directSender
+        ? `${directSender}: ${params.body}`
+        : !isDirect && sender
+          ? `${sanitizeEnvelopeHeaderPart(sender)}: ${params.body}`
+          : params.body;
   const parts = [sanitizeEnvelopeHeaderPart(params.channel?.trim() || "Channel")];
   const from = params.from?.trim();
   if (from) {
@@ -223,7 +218,7 @@ function formatInboundEnvelopeMock(params: TestInboundEnvelopeParams) {
   return `[${parts.join(" ")}] ${body}`;
 }
 
-function createChannelReplyPipelineMock() {
+function createChannelMessageReplyPipelineMock() {
   return {
     onModelSelected: undefined,
     responsePrefix: undefined,
@@ -250,6 +245,31 @@ function resolveSendableOutboundReplyPartsMock(payload: Record<string, unknown>)
       typeof payload.mediaPath === "string" ||
       typeof payload.fileUrl === "string",
   };
+}
+
+function resolveChannelMessageSourceReplyDeliveryModeMock(params: {
+  cfg: {
+    messages?: {
+      visibleReplies?: "automatic" | "message_tool";
+      groupChat?: { visibleReplies?: "automatic" | "message_tool" };
+    };
+  };
+  ctx: { ChatType?: string; CommandSource?: "text" | "native" };
+  requested?: "automatic" | "message_tool_only";
+}) {
+  if (params.requested) {
+    return params.requested;
+  }
+  if (params.ctx.CommandSource === "native") {
+    return "automatic";
+  }
+  const chatType = normalizeLowercaseStringOrEmpty(params.ctx.ChatType);
+  if (chatType === "group" || chatType === "channel") {
+    return params.cfg.messages?.groupChat?.visibleReplies === "automatic"
+      ? "automatic"
+      : "message_tool_only";
+  }
+  return params.cfg.messages?.visibleReplies === "message_tool" ? "message_tool_only" : "automatic";
 }
 
 function toLocationContextMock(location: unknown) {
@@ -406,7 +426,6 @@ function resolveChannelGroupRequireMentionMock(params: {
 
 vi.mock("./auto-reply/config.runtime.js", () => ({
   getRuntimeConfig: loadConfigMock,
-  getRuntimeConfigSourceSnapshot: loadRuntimeConfigSourceSnapshotMock,
   loadConfig: loadConfigMock,
   updateLastRoute: updateLastRouteMock,
   loadSessionStore: loadSessionStoreMock,
@@ -439,12 +458,12 @@ vi.mock("./inbound/runtime-api.js", () => ({
 }));
 
 vi.mock("./auto-reply/monitor/inbound-dispatch.runtime.js", () => ({
-  createChannelReplyPipeline: createChannelReplyPipelineMock,
+  createChannelMessageReplyPipeline: createChannelMessageReplyPipelineMock,
   dispatchReplyWithBufferedBlockDispatcher: createBufferedDispatchReplyMock(),
-  finalizeInboundContext: <T>(ctx: T) => ctx,
   getAgentScopedMediaLocalRoots: () => [] as string[],
   jidToE164: normalizePhoneLikeToE164,
   logVerbose: (_msg: string) => undefined,
+  resolveChannelMessageSourceReplyDeliveryMode: resolveChannelMessageSourceReplyDeliveryModeMock,
   resolveChunkMode: () => undefined,
   resolveIdentityNamePrefix: resolveIdentityNamePrefixMock,
   resolveInboundLastRouteSessionKey: (params: { sessionKey: string }) => params.sessionKey,
@@ -468,16 +487,17 @@ vi.mock("./auto-reply/monitor/runtime-api.js", () => ({
       ? `Chat messages since your last reply:\n${rendered}\n\n${params.currentMessage}`
       : params.currentMessage;
   },
-  createChannelReplyPipeline: createChannelReplyPipelineMock,
+  createChannelMessageReplyPipeline: createChannelMessageReplyPipelineMock,
   dispatchReplyWithBufferedBlockDispatcher: createBufferedDispatchReplyMock(),
-  finalizeInboundContext: <T>(ctx: T) => ctx,
   formatInboundEnvelope: formatInboundEnvelopeMock,
   getAgentScopedMediaLocalRoots: () => [] as string[],
+  isControlCommandMessage: () => false,
   jidToE164: normalizePhoneLikeToE164,
   logVerbose: (_msg: string) => undefined,
   normalizeE164: normalizePhoneLikeToE164,
   readStoreAllowFromForDmPolicy: async () => [] as string[],
   recordSessionMetaFromInbound: async () => undefined,
+  resolveChannelMessageSourceReplyDeliveryMode: resolveChannelMessageSourceReplyDeliveryModeMock,
   resolveChannelContextVisibilityMode: resolveChannelContextVisibilityModeMock,
   resolveChunkMode: () => undefined,
   resolveIdentityNamePrefix: resolveIdentityNamePrefixMock,
@@ -498,7 +518,6 @@ vi.mock("./auto-reply/monitor/runtime-api.js", () => ({
     const first = params.allowFrom?.[0];
     return first ? params.normalizeEntry(first) : null;
   },
-  resolveDmGroupAccessWithCommandGate: () => ({ commandAuthorized: true }),
   resolveSendableOutboundReplyParts: resolveSendableOutboundReplyPartsMock,
   resolveTextChunkLimit: () => 64_000,
   shouldComputeCommandAuthorized: () => false,
@@ -507,6 +526,13 @@ vi.mock("./auto-reply/monitor/runtime-api.js", () => ({
 }));
 
 vi.mock("./auto-reply/monitor/group-gating.runtime.js", () => ({
+  createChannelHistoryWindow: (params: { historyMap: Map<string, unknown[]> }) => ({
+    record: (recordParams: { historyKey: string; limit: number; entry: unknown }) => {
+      const current = params.historyMap.get(recordParams.historyKey) ?? [];
+      const next = [...current, recordParams.entry].slice(-recordParams.limit);
+      params.historyMap.set(recordParams.historyKey, next);
+    },
+  }),
   hasControlCommand: (body: string) => body.trim().startsWith("/"),
   implicitMentionKindWhen: (kind: string, enabled: boolean) => (enabled ? [kind] : []),
   normalizeE164: normalizePhoneLikeToE164,
@@ -585,12 +611,11 @@ vi.mock("./auto-reply/monitor/message-line.runtime.js", () => ({
   resolveMessagePrefix: (
     cfg: {
       channels?: { whatsapp?: { messagePrefix?: string; allowFrom?: string[] } };
-      messages?: { messagePrefix?: string };
     },
     _agentId: string,
     params?: { configured?: string; hasAllowFrom?: boolean },
   ) => {
-    const configured = params?.configured ?? cfg.messages?.messagePrefix;
+    const configured = params?.configured ?? cfg.channels?.whatsapp?.messagePrefix;
     if (configured !== undefined) {
       return configured;
     }
